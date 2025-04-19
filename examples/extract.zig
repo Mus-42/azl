@@ -35,8 +35,12 @@ pub fn main() !void {
     while (try iter.next()) |entry| {
         std.debug.print("extracting {s}\n", .{entry.name});
         if (entry.isDirectory()) {
-            try out_dir.makeDir(entry.name[0 .. entry.name.len - 1]);
+            try out_dir.makePath(entry.name[0 .. entry.name.len - 1]);
             continue;
+        }
+
+        if (std.fs.path.dirname(entry.name)) |dirname| {
+            try out_dir.makePath(dirname);
         }
 
         const entry_out = try out_dir.createFile(entry.name, .{});

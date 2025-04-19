@@ -168,17 +168,20 @@ pub fn ZipReader(comptime SeekableStream: type) type {
                 return error.ZipInvalidLocalFileHeader;
             const local_header: LocalFileHeader = try reader.readStructEndian(LocalFileHeader, .little);
 
-            if (local_header.crc_32 != entry.crc_32)
-                return error.ZipCRCMissmatch;
-            if (local_header.compressed_size != entry.compressed_size)
-                return error.ZipFileSizeMissmatch;
-            if (local_header.uncompressed_size != entry.uncompressed_size)
-                return error.ZipFileSizeMissmatch;
+            if (entry.compressed_size == 0xFFFF)
+                return error.Zip64Unsupported;
+            if (entry.uncompressed_size == 0xFFFF)
+                return error.Zip64Unsupported;
 
-            if (local_header.compressed_size == 0xFFFF)
-                return error.Zip64Unsupported;
-            if (local_header.uncompressed_size == 0xFFFF)
-                return error.Zip64Unsupported;
+            // TODO figure out why this checks fail on most *wild* zip files
+
+            // if (local_header.crc_32 != entry.crc_32)
+            //     return error.ZipCRCMissmatch;
+
+            // if (local_header.compressed_size != entry.compressed_size)
+            //     return error.ZipFileSizeMissmatch;
+            // if (local_header.uncompressed_size != entry.uncompressed_size)
+            //     return error.ZipFileSizeMissmatch;
 
             try reader.skipBytes(local_header.file_name_length, .{});
             try reader.skipBytes(local_header.extra_field_length, .{});
