@@ -1,4 +1,5 @@
 const std = @import("std");
+const Alloc = std.mem.Allocator;
 
 pub const CompressionMethod = enum(u16) {
     none    = 0,
@@ -18,6 +19,8 @@ pub const Version = extern struct {
     zip_version: u8,
     made_by: u8,
 };
+
+const AZL_ZIP_VESION: Version = .{ .zip_version = 20, .made_by = 0 };
 
 pub const LocalFileHeader = extern struct {
     version_required: Version,
@@ -101,6 +104,8 @@ pub fn ZipReader(comptime SeekableStream: type) type {
             compressed_size: u32,
             uncompressed_size: u32,
             compression_method: CompressionMethod,
+            last_modified_time: u16,
+            last_modified_date: u16,
             offset: u64,
             crc_32: u32,
 
@@ -148,6 +153,8 @@ pub fn ZipReader(comptime SeekableStream: type) type {
                 .compression_method = header.compression_method,
                 .offset = header.relative_offset_of_local_header,
                 .crc_32 = header.crc_32,
+                .last_modified_time = header.last_modified_time,
+                .last_modified_date = header.last_modified_date,
             };
         }
 
@@ -168,20 +175,19 @@ pub fn ZipReader(comptime SeekableStream: type) type {
                 return error.ZipInvalidLocalFileHeader;
             const local_header: LocalFileHeader = try reader.readStructEndian(LocalFileHeader, .little);
 
-            if (entry.compressed_size == 0xFFFF)
+            const max_len = std.math.maxInt(u32);
+            if (entry.compressed_size == max_len or local_header.compressed_size == max_len)
                 return error.Zip64Unsupported;
-            if (entry.uncompressed_size == 0xFFFF)
+            if (entry.uncompressed_size == max_len or local_header.uncompressed_size == max_len)
                 return error.Zip64Unsupported;
 
-            // TODO figure out why this checks fail on most *wild* zip files
+            if (local_header.crc_32 != entry.crc_32 and local_header.crc_32 != 0)
+                return error.ZipCRCMissmatch;
 
-            // if (local_header.crc_32 != entry.crc_32)
-            //     return error.ZipCRCMissmatch;
-
-            // if (local_header.compressed_size != entry.compressed_size)
-            //     return error.ZipFileSizeMissmatch;
-            // if (local_header.uncompressed_size != entry.uncompressed_size)
-            //     return error.ZipFileSizeMissmatch;
+            if (local_header.compressed_size != entry.compressed_size and local_header.compressed_size != 0)
+                return error.ZipFileSizeMissmatch;
+            if (local_header.uncompressed_size != entry.uncompressed_size and local_header.uncompressed_size != 0)
+                return error.ZipFileSizeMissmatch;
 
             try reader.skipBytes(local_header.file_name_length, .{});
             try reader.skipBytes(local_header.extra_field_length, .{});
@@ -236,3 +242,146 @@ pub fn ZipReader(comptime SeekableStream: type) type {
 }
 
 // TODO decompression tests for bad archives
+
+pub fn ZipWriter(comptime Writer: type) type {
+    return struct {
+        alloc: Alloc,
+        writer: Writer,
+        cd_entries: std.ArrayList(CDEntry),
+        compression_buf: std.ArrayList(u8),
+        file_pos: u64 = 0,
+
+        const CDEntry = struct {
+            filename: []const u8,
+            crc_32: u32,
+            compression_method: CompressionMethod = .deflate,
+            last_modified_time: u16,
+            last_modified_date: u16,
+            compressed_size: u32,
+            uncompressed_size: u32,
+            relative_offset_of_local_header: u32,
+        };
+
+        const Self = @This();
+            
+        pub fn init(alloc: Alloc, writer: Writer) !Self {
+            return .{
+                .alloc = alloc,
+                .writer = writer,
+                .cd_entries = std.ArrayList(CDEntry).init(alloc),
+                .compression_buf = std.ArrayList(u8).init(alloc),
+            };
+        }
+    
+        pub const AddFileOptions = struct {
+            filename: []const u8,
+            compression_method: CompressionMethod = .deflate,
+            last_modified_time: u16 = 0,
+            last_modified_date: u16 = 0,
+        };
+
+        pub fn addFile(self: *Self, filedata: []const u8, options: AddFileOptions) !void {
+            const max_len = std.math.maxInt(u32);
+            if (filedata.len >= max_len) 
+                return error.ZipFileTooBig;
+
+            try self.cd_entries.ensureUnusedCapacity(1);
+            const filename = try self.alloc.dupe(u8, options.filename);
+            errdefer self.alloc.free(filename); 
+
+            const compressed = if (options.compression_method == .deflate) blk: {
+                self.compression_buf.clearRetainingCapacity();
+                var compressor = try std.compress.flate.compressor(self.compression_buf.writer(), .{});
+                _ = try compressor.write(filedata);
+                try compressor.finish();
+                break :blk self.compression_buf.items;
+            } else filedata;
+
+            const crc_32 = std.hash.Crc32.hash(filedata);
+
+
+            self.cd_entries.appendAssumeCapacity(.{
+                .filename = filename,
+                .crc_32 = crc_32,
+                .compressed_size = @intCast(compressed.len),
+                .uncompressed_size = @intCast(filedata.len),
+                .compression_method = options.compression_method,
+                .last_modified_time = options.last_modified_time,
+                .last_modified_date = options.last_modified_date,
+                .relative_offset_of_local_header = @intCast(self.file_pos),
+            });
+
+            try self.writer.writeInt(u32, @intFromEnum(Signature.local_file_header), .little);
+            try self.writer.writeStructEndian(LocalFileHeader{
+                .version_required = AZL_ZIP_VESION,
+                .flags = 0,
+                .compression = options.compression_method,
+                .last_modified_time = options.last_modified_time,
+                .last_modified_date = options.last_modified_date,
+                .crc_32 = crc_32,
+                .compressed_size = @intCast(compressed.len),
+                .uncompressed_size = @intCast(filedata.len),
+                .file_name_length = @intCast(filename.len),
+                .extra_field_length = 0,
+            }, .little);
+
+            try self.writer.writeAll(filename);
+            try self.writer.writeAll(compressed);
+
+            self.file_pos += compressed.len + filename.len + @sizeOf(LocalFileHeader) + 4;
+
+            if (self.file_pos >= max_len)
+                return error.ZipFileTooBig;
+        }
+
+        /// Write central direcoty header
+        pub fn finish(self: *Self) !void {
+            const cd_offset: u32 = @intCast(self.file_pos); 
+            var cd_size: u64 = 0;
+                
+            for (self.cd_entries.items) |entry| {
+                try self.writer.writeInt(u32, @intFromEnum(Signature.central_directory_file_header), .little);
+                try self.writer.writeStructEndian(CentralDirectoryFileHeader{
+                    .version_required = AZL_ZIP_VESION,
+                    .version_created = AZL_ZIP_VESION,
+                    .flags = 0,
+                    .compression_method = entry.compression_method,
+                    .last_modified_time = entry.last_modified_time,
+                    .last_modified_date = entry.last_modified_date,
+                    .crc_32 = entry.crc_32,
+                    .compressed_size = entry.compressed_size,
+                    .uncompressed_size = entry.uncompressed_size,
+                    .file_name_length = @intCast(entry.filename.len),
+                    .extra_field_length = 0,
+                    .file_comment_length = 0,
+                    .disk_number_start = 0,
+                    .internal_file_attributes = 0,
+                    .external_file_attributes = 0,
+                    .relative_offset_of_local_header = entry.relative_offset_of_local_header,
+                }, .little);
+                try self.writer.writeAll(entry.filename);
+                cd_size += @sizeOf(CentralDirectoryFileHeader) + 4 + entry.filename.len;
+            }
+
+            const entries: u16 = @intCast(self.cd_entries.items.len); 
+            try self.writer.writeInt(u32, @intFromEnum(Signature.end_of_central_directory), .little);
+            try self.writer.writeStructEndian(EndOfCentralDirectory{
+                .this_disk_num = 0,
+                .cd_start_disk_num = 0,
+                .this_disk_entries = entries,
+                .total_cd_entries = entries,
+                .cd_size = @intCast(cd_size),
+                .cd_offset = cd_offset,
+                .file_comment_length = 0,
+            }, .little);
+        }
+
+        pub fn deinit(self: Self) void {
+            for (self.cd_entries.items) |entry| {
+                self.alloc.free(entry.filename);
+            }
+            self.cd_entries.deinit(); 
+            self.compression_buf.deinit(); 
+        }
+    };
+}
