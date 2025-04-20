@@ -2,7 +2,7 @@ const std = @import("std");
 const azl = @import("azl");
 
 fn print_usage() void {
-    std.debug.print("usage: [dir_to_compress] [archive.zip]", .{});
+    std.debug.print("usage: [dir_to_compress] [archive.zip]\n", .{});
 }
 
 pub fn main() !void {
