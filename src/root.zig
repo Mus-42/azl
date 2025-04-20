@@ -242,6 +242,9 @@ pub fn ZipReader(comptime SeekableStream: type) type {
 }
 
 // TODO decompression tests for bad archives
+pub fn zipReader(stream: anytype) !ZipReader(@TypeOf(stream)) {
+    return ZipReader(@TypeOf(stream)).init(stream);
+}
 
 pub fn ZipWriter(comptime Writer: type) type {
     return struct {
@@ -384,4 +387,9 @@ pub fn ZipWriter(comptime Writer: type) type {
             self.compression_buf.deinit(); 
         }
     };
+}
+
+
+pub fn zipWriter(alloc: Alloc, writer: anytype) !ZipWriter(@TypeOf(writer)) {
+    return ZipWriter(@TypeOf(writer)).init(alloc, writer);
 }

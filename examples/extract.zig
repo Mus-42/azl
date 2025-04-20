@@ -28,7 +28,7 @@ pub fn main() !void {
     defer file.close();
 
     const stream = file.seekableStream();
-    var iter = try azl.ZipReader(@TypeOf(stream)).init(stream);
+    var iter = try azl.zipReader(stream);
     defer iter.deinit();
 
 

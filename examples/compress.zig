@@ -32,7 +32,7 @@ pub fn main() !void {
     defer file.close();
 
     var buf_writer = std.io.bufferedWriter(file.writer());
-    var zip_writer = try azl.ZipWriter(@TypeOf(buf_writer.writer())).init(alloc, buf_writer.writer());
+    var zip_writer = try azl.zipWriter(alloc, buf_writer.writer());
     defer zip_writer.deinit();
 
     while (try dir_iter.next()) |entry| {
