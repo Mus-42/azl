@@ -1,6 +1,8 @@
 .{
-    .name = "azl",
+    .name = .azl,
     .version = "0.0.0",
+    .minimum_zig_version = "0.14.0",
+    .fingerprint = 0x2780c40afc0717c0,
     .dependencies = .{},
     .paths = .{
         "build.zig",
