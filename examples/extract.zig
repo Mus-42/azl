@@ -26,11 +26,12 @@ pub fn main() !void {
 
     const file = try std.fs.cwd().openFile(archive_filename, .{});
     defer file.close();
-
-    const stream = file.seekableStream();
-    var iter = try azl.zipReader(stream);
-    defer iter.deinit();
-
+    
+    // TODO
+    var buf: [256]u8 = undefined;
+    var buf2: [256]u8 = undefined;
+    var reader = file.reader(&buf);
+    var iter = try azl.zipReader(&reader);
 
     while (try iter.next()) |entry| {
         std.debug.print("extracting {s}\n", .{entry.name});
@@ -45,6 +46,7 @@ pub fn main() !void {
 
         const entry_out = try out_dir.createFile(entry.name, .{});
         defer entry_out.close();
-        try iter.extractFile(entry, entry_out.writer());
+        var writer = entry_out.writer(&buf2);
+        try iter.extractFile(entry, &writer.interface);
     }
 }

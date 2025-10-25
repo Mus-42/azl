@@ -66,17 +66,18 @@ pub const EndOfCentralDirectory = extern struct {
 
 fn readEndOfCentralDirectory(stream: anytype) !EndOfCentralDirectory {
     // TODO here should be some smart search logic instead?
-    const stream_len = try stream.getEndPos();
+    const stream_len = try stream.getSize();
     const cd_end_len = @sizeOf(EndOfCentralDirectory) + 4;
     if (stream_len < cd_end_len) 
         return error.ZipNoCentralDirectory;
     try stream.seekTo(stream_len - cd_end_len);
 
-    const reader = stream.context.reader();
-    const signature: Signature = @enumFromInt(try reader.readInt(u32, .little));
+    const reader = &stream.interface;
+    try reader.fill(cd_end_len);
+    const signature: Signature = @enumFromInt(try reader.takeInt(u32, .little));
     if (signature != .end_of_central_directory) 
         return error.ZipNoCentralDirectory;
-    const cd_end = try reader.readStructEndian(EndOfCentralDirectory, .little);
+    const cd_end = try reader.takeStruct(EndOfCentralDirectory, .little);
 
     // sanity checks (verify some assumptions that library make about file)
     if (cd_end.this_disk_num != 0)
@@ -128,16 +129,20 @@ pub fn ZipReader(comptime SeekableStream: type) type {
         pub fn next(self: *Self) !?Entry {
             if (self.cd_entry_current >= self.cd_entries) return null;
             self.cd_entry_current += 1;
-            const reader = self.stream.context.reader();
-            const signature: Signature = @enumFromInt(try reader.readInt(u32, .little));
+            const reader = &self.stream.interface;
+            try reader.fill(@sizeOf(Signature) + @sizeOf(CentralDirectoryFileHeader));
+            const signature = try reader.takeEnum(Signature, .little);
+            std.debug.print("sign: {x}\n", .{@intFromEnum(signature)});
+            std.debug.print("pos: {x}\n", .{self.stream.logicalPos()});
             if (signature != .central_directory_file_header) 
                 return error.ZipInvalidCDFileHeader;
 
-            const header = try reader.readStructEndian(CentralDirectoryFileHeader, .little);
+            const header = try reader.takeStruct(CentralDirectoryFileHeader, .little);
             
-            try reader.readNoEof(self.name_buf[0..header.file_name_length]);
-            try reader.skipBytes(header.extra_field_length, .{});
-            try reader.skipBytes(header.file_comment_length, .{});
+            try reader.fill(header.file_name_length);
+            try reader.readSliceAll(self.name_buf[0..header.file_name_length]);
+            try reader.discardAll(header.extra_field_length);
+            try reader.discardAll(header.file_comment_length);
 
             if (header.file_name_length > self.name_buf.len)
                 return error.ZipFileNameTooLong;
@@ -158,22 +163,22 @@ pub fn ZipReader(comptime SeekableStream: type) type {
             };
         }
 
-        pub fn extractFile(self: Self, entry: Entry, output_steam: anytype) !void {
+        pub fn extractFile(self: Self, entry: Entry, output_stream: anytype) !void {
             std.debug.assert(!entry.isDirectory());
 
             if (entry.compression_method != .deflate and entry.compression_method != .none) 
                 return error.ZipUnsupportedCompressionMethod;
 
-            const old_pos = try self.stream.getPos();
+            const old_pos = self.stream.logicalPos();
             try self.stream.seekTo(entry.offset);
-            const raw_reader = self.stream.context.reader();
-            var buf_reader = std.io.bufferedReader(raw_reader);
-            const reader = buf_reader.reader();
+            const reader = &self.stream.interface;
 
-            const signature: Signature = @enumFromInt(try reader.readInt(u32, .little));
+            try reader.fill(@sizeOf(Signature) + @sizeOf(LocalFileHeader));
+            const signature = try reader.takeEnum(Signature, .little);
+            std.debug.print("pos: {d} signature: {d}\n", .{old_pos, @intFromEnum(signature)});
             if (signature != .local_file_header) 
                 return error.ZipInvalidLocalFileHeader;
-            const local_header: LocalFileHeader = try reader.readStructEndian(LocalFileHeader, .little);
+            const local_header = try reader.takeStruct(LocalFileHeader, .little);
 
             const max_len = std.math.maxInt(u32);
             if (entry.compressed_size == max_len or local_header.compressed_size == max_len)
@@ -189,49 +194,38 @@ pub fn ZipReader(comptime SeekableStream: type) type {
             if (local_header.uncompressed_size != entry.uncompressed_size and local_header.uncompressed_size != 0)
                 return error.ZipFileSizeMissmatch;
 
-            try reader.skipBytes(local_header.file_name_length, .{});
-            try reader.skipBytes(local_header.extra_field_length, .{});
+            try reader.discardAll(local_header.file_name_length);
+            try reader.discardAll(local_header.extra_field_length);
 
-            var crc = std.hash.crc.Crc32.init();
             var uncompressed_size: u32 = 0;
-            
+            var buf: [1024]u8 = undefined;
+            var buf2: [1024]u8 = undefined;
+            std.debug.print("size: {d}\n", .{entry.compressed_size});
+            var limited = reader.limited(@enumFromInt(entry.compressed_size), &buf);
+            var sink = output_stream.hashed(std.hash.crc.Crc32.init(), &buf2);
             switch(entry.compression_method) {
                 .none => {
-                    var lr = std.io.limitedReader(reader, entry.compressed_size);
-                    var buf: [4096]u8 = undefined;
-                    while (true) {
-                        const len = try lr.read(&buf);
-                        if (len == 0) break;
-
-                        uncompressed_size += @intCast(len);
-                        if (uncompressed_size > entry.uncompressed_size)
-                            return error.ZipFileSizeMissmatch;
-
-                        crc.update(buf[0..len]);
-                        try output_steam.writeAll(buf[0..len]);
-                    }
+                    uncompressed_size = @intCast(try limited.interface.streamRemaining(&sink.writer));
                 },
                 .deflate => {
-                    var lr = std.io.limitedReader(reader, entry.compressed_size);
-                    var decompressor = std.compress.flate.decompressor(lr.reader());
-                    while (try decompressor.next()) |buf| {
-                        uncompressed_size += @intCast(buf.len);
-                        if (uncompressed_size > entry.uncompressed_size)
-                            return error.ZipFileSizeMissmatch;
-
-                        crc.update(buf);
-                        try output_steam.writeAll(buf);
-                    }
+                    var decompress: std.compress.flate.Decompress = .init(&limited.interface, .raw, &.{});
+                    // fails inside std.compress.flate.Decompress
+                    uncompressed_size = @intCast(try decompress.reader.streamRemaining(&sink.writer));
                 },
                 _ => unreachable,
             }
 
+            try sink.writer.flush();
+
             if (uncompressed_size != entry.uncompressed_size)
                 return error.ZipFileSizeMissmatch;
 
-            if (crc.final() != entry.crc_32)
+            const final_crc = sink.hasher.final();
+            std.debug.print("crc: {x} {x}\n", .{final_crc, entry.crc_32});
+            if (final_crc != entry.crc_32)
                 return error.ZipCRCMissmatch;
 
+            // TODO do remove?
             try self.stream.seekTo(old_pos);
         }
 
