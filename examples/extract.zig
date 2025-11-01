@@ -5,6 +5,8 @@ fn print_usage() void {
     std.debug.print("usage: [extract_dir] [archive.zip]\n", .{});
 }
 
+var buf2: [32768 * 4]u8 = undefined;
+
 pub fn main() !void {
     var args = std.process.args();
     _ = args.next().?;
@@ -29,7 +31,6 @@ pub fn main() !void {
     
     // TODO
     var buf: [256]u8 = undefined;
-    var buf2: [256]u8 = undefined;
     var reader = file.reader(&buf);
     var iter = try azl.zipReader(&reader);
 
@@ -43,6 +44,8 @@ pub fn main() !void {
         if (std.fs.path.dirname(entry.name)) |dirname| {
             try out_dir.makePath(dirname);
         }
+
+        
 
         const entry_out = try out_dir.createFile(entry.name, .{});
         defer entry_out.close();

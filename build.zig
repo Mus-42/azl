@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
     for (EXAMPLES) |example| {
         const example_exe = b.addExecutable(.{
             .name = example.name,
-            .root_module = b.createModule(.{ 
+            .root_module = b.createModule(.{
                 .root_source_file = b.path(example.root_file),
                 .target = target,
                 .optimize = optimize,
@@ -41,7 +41,6 @@ pub fn build(b: *std.Build) void {
         const run_step = b.step(example.name, "run example");
         run_step.dependOn(&run_example.step);
     }
-
 
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{

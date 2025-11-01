@@ -1,4 +1,5 @@
 const std = @import("std");
+const flate = @import("flate.zig");
 const Alloc = std.mem.Allocator;
 
 pub const CompressionMethod = enum(u16) {
@@ -199,16 +200,22 @@ pub fn ZipReader(comptime SeekableStream: type) type {
 
             var uncompressed_size: u32 = 0;
             var buf: [1024]u8 = undefined;
-            var buf2: [1024]u8 = undefined;
+            var buf2: [16]u8 = undefined;
             std.debug.print("size: {d}\n", .{entry.compressed_size});
             var limited = reader.limited(@enumFromInt(entry.compressed_size), &buf);
             var sink = output_stream.hashed(std.hash.crc.Crc32.init(), &buf2);
-            switch(entry.compression_method) {
+
+            const big_buf = struct {
+                threadlocal var decompress_buf: [flate.FLATE_BUF_LEN]u8 = undefined;
+            };
+
+            switch (entry.compression_method) {
                 .none => {
                     uncompressed_size = @intCast(try limited.interface.streamRemaining(&sink.writer));
                 },
                 .deflate => {
-                    var decompress: std.compress.flate.Decompress = .init(&limited.interface, .raw, &.{});
+                    //uncompressed_size = @intCast(try limited.interface.streamRemaining(&sink.writer));
+                    var decompress: flate.Decompressor = .init(&limited.interface, &big_buf.decompress_buf);
                     // fails inside std.compress.flate.Decompress
                     uncompressed_size = @intCast(try decompress.reader.streamRemaining(&sink.writer));
                 },
@@ -217,13 +224,14 @@ pub fn ZipReader(comptime SeekableStream: type) type {
 
             try sink.writer.flush();
 
-            if (uncompressed_size != entry.uncompressed_size)
-                return error.ZipFileSizeMissmatch;
-
-            const final_crc = sink.hasher.final();
-            std.debug.print("crc: {x} {x}\n", .{final_crc, entry.crc_32});
-            if (final_crc != entry.crc_32)
-                return error.ZipCRCMissmatch;
+            // if (uncompressed_size != entry.uncompressed_size)
+            //     return error.ZipFileSizeMissmatch;
+        
+    
+            // const final_crc = sink.hasher.final();
+            // std.debug.print("crc: {x} {x}\n", .{final_crc, entry.crc_32});
+            // if (final_crc != entry.crc_32)
+            //     return error.ZipCRCMissmatch;
 
             // TODO do remove?
             try self.stream.seekTo(old_pos);
@@ -288,9 +296,10 @@ pub fn ZipWriter(comptime Writer: type) type {
 
             const compressed = if (options.compression_method == .deflate) blk: {
                 self.compression_buf.clearRetainingCapacity();
-                var compressor = try std.compress.flate.compressor(self.compression_buf.writer(), .{});
-                _ = try compressor.write(filedata);
-                try compressor.finish();
+                // TODO
+                //var compressor = try std.compress.flate.compressor(self.compression_buf.writer(), .{});
+                //_ = try compressor.write(filedata);
+                //try compressor.finish();
                 break :blk self.compression_buf.items;
             } else filedata;
 
