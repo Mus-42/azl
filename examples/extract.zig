@@ -51,5 +51,6 @@ pub fn main() !void {
         defer entry_out.close();
         var writer = entry_out.writer(&buf2);
         try iter.extractFile(entry, &writer.interface);
+        try writer.end();
     }
 }

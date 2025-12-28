@@ -1,138 +1,256 @@
 const std = @import("std");
 
 pub const FLATE_BUF_LEN = 32 * 1024;
-pub const HUFFMAN_TREE_MAX_LEN = 288;
-pub const MAX_CODE_BITS = 15;
 
-const LEN_SYM_EXTRA_BITS: [30]u4 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0, 0 };
-const LEN_SYM_OFFSETS: [30]u16 = .{ 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258, 0 };
-
+const LIT_SYM_EXTRA_BITS: [30]u4 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0, 0 };
+const LIT_SYM_OFFSETS: [30]u16 = .{ 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258, 0 };
 
 const DIST_SYM_EXTRA_BITS: [30]u4 =.{ 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
 const DIST_SYM_OFFSETS: [30]u16 = .{ 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
 
+const BitReader = struct {
+    buffered: u32 = 0,
+    buffered_count: u5 = 0,
 
-const HuffmanTree = struct {
-    nodes: [HUFFMAN_TREE_MAX_LEN]TreeNode = undefined,
-    len_counts: [MAX_CODE_BITS]u15 = undefined,
-    len_lookup: [MAX_CODE_BITS]u16 = undefined,
-
-    const TreeNode = packed struct {
-        code: u15 = 0,
-        // 0 means not used
-        code_len: u4 = 0,
-        symbol: u9 = 0,
-    };
-    
     const Self = @This();
 
-    fn loadStatic(self: *Self) void {
-        self.clear();
-        for (0.., &self.nodes) |i, *node| {
-            node.symbol = @intCast(i);
-            if (i < 144) { node.code_len = 8; }
-            else if (i < 256) { node.code_len = 9; }
-            else if (i < 280) { node.code_len = 7; }
-            else { node.code_len = 8; }
+    fn informBytesSkippedExternaly(self: *Self, count: usize) void {
+        if (count * 8 >= self.buffered_count) {
+            self.buffered = 0;
+            self.buffered_count = 0;
+            return;
         }
-
-        self.rebuildCodes();
-        self.rebuildLenLookup();
+        self.buffered >>= @intCast(count * 8);
+        self.buffered_count -= @intCast(count * 8);
     }
 
-    fn debugDump(self: *Self) void {
-        for (&self.nodes) |node| {
-            if (node.code_len > 0) {
-                std.debug.print("{d:03} {b:0>[2]}\n", .{node.symbol, node.code, node.code_len});
+    fn byteAlignDiscarding(self: *Self) void {
+        self.buffered_count = 0;
+        self.buffered = 0;
+    }
+
+    fn takeBits(self: *Self, input: *std.io.Reader, count: u4) !u16 {
+        const bits = try self.peekBits(input, count);
+        self.tossBits(input, count);
+        return bits;
+    }
+
+    fn takeUint(self: *Self, input: *std.io.Reader, comptime U: type) !U {
+        return @intCast(try self.takeBits(input, @intCast(@bitSizeOf(U))));
+    }
+
+    fn peekBits(self: *Self, input: *std.io.Reader, count: u4) !u16 {
+        if (count == 0) return 0;
+        while (count > self.buffered_count) {
+            const pos = self.buffered_count >> 3;
+            const byte = if (input.peek(pos+1)) |slice| slice[pos] else |err| switch (err) {
+                // handle EoS as zeros
+                // for trusted files that part would be newer used
+                error.EndOfStream => 0,
+                else => return err,
+            };
+            // std.debug.print("0x{X:0}\n", .{byte});
+            self.buffered |= @as(u32, byte) << self.buffered_count;
+            self.buffered_count += 8;
+        }
+        const ret = self.buffered & ((@as(u32, 1)<<count)-1);
+        // std.debug.print("{b:0<[1]}\n", .{ret, count});
+        return @intCast(ret);
+    }
+
+    fn tossBits(self: *Self, input: *std.io.Reader, count: u4) void {
+        std.debug.assert(self.buffered_count >= count);
+        if (count == 0) return;
+        const to_toss = (@as(u5, count) -| (self.buffered_count&7) + 7) >> 3;
+        // std.debug.print("tossed: {}\n", .{to_toss});
+        input.toss(to_toss);
+        self.buffered_count -= count;
+        self.buffered >>= count;
+    }
+};
+
+// Literal/length codes tree
+const LitHuffmanTree = HuffmanTree(286, 15);
+// Distance codes tree
+const DistHuffmanTree = HuffmanTree(30, 15);
+// Code lengths tree
+const CodeLenHuffmanTree = HuffmanTree(19, 15);
+
+fn HuffmanTree(comptime max_nodes: usize, comptime max_code_bits: u4) type {
+    return struct {
+        nodes: [max_nodes]TreeNode,
+        len_counts: [max_code_bits]u15,
+        len_lookup: [max_code_bits]u16,
+
+        const TreeNode = packed struct {
+            code: u15 = 0,
+            // 0 means not used
+            code_len: u4 = 0,
+            symbol: u9 = 0,
+        };
+        
+        const Self = @This();
+
+        fn init(self: *Self, lengths: []const u4) void {
+            std.debug.assert(lengths.len <= max_nodes);
+            //std.debug.print("lengths = {any}\n", .{lengths});
+            self.clear();
+            for (0.., self.nodes[0..lengths.len], lengths) |i, *node, len| {
+                node.symbol = @intCast(i);
+                node.code_len = len;
+            }
+            self.orderNodes();
+            self.updateLenCounts();
+            self.rebuildCodesFromLengths();
+            self.rebuildLenLookup();
+        }
+
+        fn initLitStatic(self: *Self) void {
+            comptime { std.debug.assert(max_nodes == 286); }
+
+            self.clear();
+            for (0.., &self.nodes) |i, *node| {
+                node.symbol = @intCast(i);
+                if (i < 144) { node.code_len = 8; }
+                else if (i < 256) { node.code_len = 9; }
+                else if (i < 280) { node.code_len = 7; }
+                else { node.code_len = 8; }
+            }
+            self.orderNodes();
+            self.updateLenCounts();
+            // Symbols 286-287 participate in code consturction but not present in actual tree
+            self.len_counts[8-1] += 2;
+            self.rebuildCodesFromLengths();
+            self.len_counts[8-1] -= 2;
+            self.rebuildLenLookup();
+        }
+
+        fn initDistStatic(self: *Self) void {
+            comptime { std.debug.assert(max_nodes == 30); }
+
+            self.clear();
+            for (0.., &self.nodes) |i, *node| {
+                node.symbol = @intCast(i);
+                node.code_len = 5;
+            }
+            self.orderNodes();
+            self.updateLenCounts();
+            self.rebuildCodesFromLengths();
+            self.rebuildLenLookup();
+        }
+
+        fn debugDump(self: *const Self) void {
+            for (&self.nodes) |node| {
+                if (node.code_len > 0) {
+                    std.debug.print("{d:03} {b:0>[2]}\n", .{node.symbol, node.code, node.code_len});
+                }
             }
         }
-    }
 
-    fn clear(self: *Self) void {
-        @memset(&self.nodes, .{});
-    }
+        fn clear(self: *Self) void {
+            @memset(&self.nodes, .{});
+        }
 
-    fn rebuildCodes(self: *Self) void {
-        var next_code: [MAX_CODE_BITS]u15 = @splat(0);
-        self.len_counts = @splat(0);
-
-        for (&self.nodes) |node| {
-            if (node.code_len > 0) {
-                self.len_counts[node.code_len - 1] += 1;
+        fn updateLenCounts(self: *Self) void {
+            self.len_counts = @splat(0);
+            for (&self.nodes) |node| {
+                if (node.code_len > 0) {
+                    self.len_counts[node.code_len - 1] += 1;
+                }
             }
         }
 
-        var code: u15 = 0;
-        for (0..MAX_CODE_BITS) |bits| {
-            if (bits > 0) code += self.len_counts[bits-1];
-            code <<= 1;
-            next_code[bits] = code;
+        fn rebuildCodesFromLengths(self: *Self) void {
+            var code: u15 = 0;
+            var next_code: [max_code_bits]u16 = @splat(0);
+            for (1..max_code_bits) |bits| {
+                code += self.len_counts[bits-1];
+                code <<= 1;
+                next_code[bits] = code;
+            }
+
+            // std.debug.print("len_counts = {any}\n", .{self.len_counts});
+            // std.debug.print("next_code = {any}\n", .{next_code});
+
+            for (&self.nodes) |*node| {
+                if (node.code_len == 0)
+                    continue;
+                node.code = @intCast(next_code[node.code_len - 1]);
+                next_code[node.code_len - 1] += 1;
+            }
         }
 
-        for (&self.nodes) |*node| {
-            if (node.code_len == 0)
-                continue;
-            node.code = next_code[node.code_len - 1];
-            next_code[node.code_len - 1] += 1;
-        }
-    }
-
-    fn nodeLenLookupLessThanCmp(_: void, a: TreeNode, b: TreeNode) bool {
-        if (a.code_len != b.code_len) {
-            return a.code_len < b.code_len;
-        }
-        return a.code < b.code;
-    }
-
-    fn rebuildLenLookup(self: *Self) void {
-        std.mem.sort(TreeNode, &self.nodes, {}, nodeLenLookupLessThanCmp);
-        var i: u16 = 0;
-        while (i < self.nodes.len and self.nodes[i].code_len == 0) {
-            i += 1;
+        fn nodeLenCmp(_: void, a: TreeNode, b: TreeNode) bool {
+            if (a.code_len != b.code_len) {
+                return a.code_len < b.code_len;
+            }
+            return a.symbol < b.symbol;
         }
 
-        for (0..MAX_CODE_BITS) |bits| {
-            self.len_lookup[bits] = i;
-            i += self.len_counts[bits];
+        fn orderNodes(self: *Self) void {
+            std.sort.heap(TreeNode, &self.nodes, {}, nodeLenCmp);
         }
 
-        std.debug.assert(i == self.nodes.len);
-    }
+        fn rebuildLenLookup(self: *Self) void {
+            var i: u16 = 0;
 
-    fn lookUpSymbolByCode(self: *const Self, code: u16, code_len: u4) ?u15 {
-        std.debug.assert(code_len > 0);
+            while (i < self.nodes.len and self.nodes[i].code_len == 0) {
+                i += 1;
+            }
 
-        const len = self.len_counts[code_len - 1];
-        if (len == 0)
-            return null;
+            for (0..max_code_bits) |bits| {
+                self.len_lookup[bits] = i;
+                i += self.len_counts[bits];
+            }
 
-        // for (&self.nodes) |node| {
-        //     if (node.code_len == code_len and node.code == code)
-        //         return node.symbol;
-        // }
+            std.debug.assert(i == self.nodes.len);
+        }
 
-        // return null;
+        fn readSymbol(self: *Self, bit_reader: *BitReader, input: *std.Io.Reader) !u15 {
+            const U = std.meta.Int(.unsigned, max_code_bits);
+            var code = @bitReverse(@as(U, @intCast(try bit_reader.peekBits(input, max_code_bits))));
+            var code_bits = max_code_bits;
+            const code0 = code;
+            while (code_bits > 0) : ({
+                code_bits -= 1;
+                code >>= 1;
+            }) {
+                const len = self.len_counts[code_bits-1];
+                if (len == 0) continue;
+                const i = self.len_lookup[code_bits-1];
+                const min_code = self.nodes[i].code;
+                if (min_code <= code and code - min_code < len) {
+                    bit_reader.tossBits(input, code_bits);
+                    const index = i + code - min_code;
+                    std.debug.assert(self.nodes[index].code == code);
+                    const sym = self.nodes[index].symbol;
+                    // std.debug.print("code -> {b:0<[1]}, sym -> {[2]}\n", .{code, code_bits, sym});
+                    return sym;
+                }
+            }
+            std.debug.print("code0 -> {b:0<[1]}\n", .{code0, max_code_bits});
+            return error.InvalidHuffmanCode;
+        }
+    };
+}
 
-        const i = self.len_lookup[code_len - 1];
-        const i_code = self.nodes[i].code;
-        if (i_code > code)
-            return null;
-
-        const offset = code - i_code;
-        if (offset >= len)
-            return null;
-
-        std.debug.assert(self.nodes[i + offset].code == code);
-        return self.nodes[i + offset].symbol;
-    }
+const BlockType = enum (u2) {
+    stored  = 0b00,
+    static  = 0b01,
+    dynamic = 0b10,
 };
 
 pub const Decompressor = struct {
     reader: std.Io.Reader,
     input: *std.Io.Reader,
+    bit_reader: BitReader = .{},
+
+    buf_end: usize = 0,
     buf: []u8,
-    bit_capacity: u8,
-    huffman_tree: HuffmanTree = .{},
+
+    lit_tree: LitHuffmanTree = undefined,
+    dist_tree: DistHuffmanTree = undefined,
+
     state: State = .reading,
 
     const Self = @This();
@@ -140,10 +258,11 @@ pub const Decompressor = struct {
     const State = enum {
         reading,
         ended,
+        invalid,
     };
 
     pub fn init(input: *std.Io.Reader, buf: []u8) Self {
-        std.debug.assert(buf.len >= FLATE_BUF_LEN);
+        std.debug.assert(buf.len == FLATE_BUF_LEN);
         std.debug.assert(input.buffer.len > 0);
 
         return .{
@@ -157,207 +276,175 @@ pub const Decompressor = struct {
             },
             .input = input,
             .buf = buf,
-            .bit_capacity = 0,
         };
     }
 
-    fn byteAlign(self: *Self) void {
-        if (self.bit_capacity != 0) {
-            self.input.toss(1);
-            self.bit_capacity = 0;
-        }
-    }
+    fn readDynamicBlockHuffmanTrees(self: *Self) !void { 
+        const n_lit = try self.bit_reader.takeBits(self.input, 5) + 257;
+        const n_dist = try self.bit_reader.takeBits(self.input, 5) + 1;
+        const n_code_len = try self.bit_reader.takeBits(self.input, 4) + 4;
 
-    fn readBit(self: *Self) !u1 {
-        const first_byte = try self.input.peekByte();
-        std.debug.assert(self.bit_capacity < 8);
-        //const bit: u1 = @intCast(first_byte >> @intCast(7 - self.bit_capacity) & 1);
-        const bit: u1 = @intCast(first_byte >> @intCast(self.bit_capacity) & 1);
-        self.bit_capacity += 1;
-        if (self.bit_capacity >= 8) {
-            self.bit_capacity = 0;
-            self.input.toss(1);
-        }
-        return bit;
-    }
+        if (n_code_len > 19 or n_dist > 30 or n_lit > 286)
+            return error.InvalidCodeLen;
 
-    fn readUint(self: *Self, bits: u4) !u16 {
-        var v: u16 = 0;
-            
-        // inefficient for big numbers but we don't realy need any so it's fine
-        for (0..bits) |i| {
-            //v <<= 1;
-            //v |= try self.readBit();
-            v |= @as(u8, try self.readBit()) << @intCast(i);
-        }
-
-        return v;
-    }
-
-    fn readHuffmanTree(self: *Self) !void { 
-        const literal_len_codes = @as(usize, try self.readUint(5)) + 257;
-        const hdist = try self.readUint(5);
-        const len_codes_count = @as(usize, try self.readUint(4)) + 4;
-
-        std.debug.print("{}\n", .{len_codes_count});
-
-        // lengths alphabet
         const LEN_ORDER: [19]u8 = .{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
-
-        self.huffman_tree.clear();
-        for (0..len_codes_count) |i| {
-            const len = try self.readUint(3);
-            self.huffman_tree.nodes[i].symbol = LEN_ORDER[i];
-            self.huffman_tree.nodes[i].code_len = @intCast(len);
+        var code_len_lengths: [19]u4 = @splat(0);
+        for (0..n_code_len) |i| {
+            code_len_lengths[LEN_ORDER[i]] = try self.bit_reader.takeUint(self.input, u3);
         }
-        self.huffman_tree.rebuildCodes();
-        self.huffman_tree.rebuildLenLookup();
+        var code_len_tree: CodeLenHuffmanTree = undefined;
+        code_len_tree.init(&code_len_lengths);
 
-        self.huffman_tree.debugDump();
-
-        // lenghts for acutal deflate alphabet
-        var len_codes: [HUFFMAN_TREE_MAX_LEN]u4 = @splat(0);
+        var code_len: [286 + 30]u4 = @splat(0);
         var i: usize = 0;
-        std.debug.print("{}\n", .{literal_len_codes});
-        while (i < literal_len_codes) {
-            const len_sym = try self.readHuffmanCodeSymbol();
-            std.debug.print("{}:  len sym = {}\n", .{i, len_sym});
+        const n_lit_dist = n_lit + n_dist;
+        while (i < n_lit_dist) {
+            const len_sym = try code_len_tree.readSymbol(&self.bit_reader, self.input);
             if (len_sym < 16) {
-                len_codes[i] = @intCast(len_sym);
+                code_len[i] = @intCast(len_sym);
                 i += 1;
                 continue;
             }
 
-            if (len_sym > 18) {
-                return error.ReadFailed;
-            }
-
-            var num: usize = 0;
-            var val: u4 = 0;
-            if (len_sym == 16) {
-                if (i == 0) return error.ReadFailed;
-                num = @as(usize, try self.readUint(2)) + 3;
-                val = len_codes[i-1];
-            } else if (len_sym == 17) {
-                num = @as(usize, try self.readUint(3)) + 3;
+            if (len_sym == 17) {
+                i += @as(usize, try self.bit_reader.takeUint(self.input, u3)) + 3;
+                continue;
             } else if (len_sym == 18) {
-                num = @as(usize, try self.readUint(7)) + 11;
+                i += @as(usize, try self.bit_reader.takeUint(self.input, u7)) + 11;
+                continue;
             }
 
-            for (0..num) |_| {
-                if (i == HUFFMAN_TREE_MAX_LEN) 
-                    return error.ReadFailed;
-                len_codes[i] = val;
+            const num = @as(usize, try self.bit_reader.takeUint(self.input, u2)) + 3;
+            if (i == 0) 
+                return error.InvalidBlockHeader;
+            const val = code_len[i-1];
+            for (0..@min(num, code_len.len-i)) |_| {
+                code_len[i] = val;
                 i += 1;
             }
         }
 
-        std.debug.print("{}\n", .{hdist});
-
-        @panic("TODO read huffman tree");
+        self.lit_tree.init(code_len[0..n_lit]);
+        self.dist_tree.init(code_len[n_lit..][0..n_dist]);
     }
 
-    fn readHuffmanCodeSymbol(self: *Self) !u15 {
-        var code: u15 = 0;
-        for (0..15) |code_len| {
-            code <<= 1;
-            code |= try self.readBit();
-            //code |= @as(u15, try self.readBit()) << @intCast(code_len);
-            if (self.huffman_tree.lookUpSymbolByCode(code, @intCast(code_len + 1))) |symbol|
-                return symbol;
+
+    fn writeByte(self: *Self, w: *std.io.Writer, byte: u8) !void {
+        try w.writeByte(byte);
+        // TODO on error set state to "broken"
+        self.buf[self.buf_end] = byte;
+        self.buf_end += 1;
+        self.buf_end &= FLATE_BUF_LEN - 1;
+    }
+
+    fn bufTailForWrite(self: *Self, max_len: usize) []u8 {
+        const len = @min(FLATE_BUF_LEN - self.buf_end, max_len);
+        const slice = self.buf[self.buf_end..][0..len];
+        self.buf_end += len;
+        self.buf_end &= FLATE_BUF_LEN - 1;
+        return slice;
+    }
+
+    fn writeStreaming(self: *Self, w: *std.Io.Writer, limit: usize) !void {
+        var remaining = limit;
+        if (limit > FLATE_BUF_LEN) {
+            remaining = FLATE_BUF_LEN;
+            try self.input.streamExact(w, limit - FLATE_BUF_LEN);
         }
-        std.debug.print("failed code: {b:015}\n", .{code});
-        return error.ReadFailed;
+        
+        while (remaining != 0) {
+            const buf = self.bufTailForWrite(remaining);
+            try self.input.readSliceAll(buf);
+            try w.writeAll(buf);
+            remaining -= buf.len;
+        }
     }
 
-    const IternalBufWriter = struct {
-        reader: *Self,
-        interface: std.io.Writer,
-    };
-
-    fn iternalWriterDrain(w: *std.io.Writer, data: []const []const u8, splat: usize) std.io.Writer.Error!usize {
-        const buf_writer: *IternalBufWriter = @fieldParentPtr("interface", w);
-        // TODO
-    }
-
-    fn iternalBufWriter(self: *Self) IternalBufWriter {
-        // TODO
-        //
-        return .{
-            .reader = self,
-            .interface = .{
-                .buffer = &.{},
-                .end = 0,
-                .vtable = &.{
-                    .drain = iternalWriterDrain,
-                },
-            },
-        };
-    }
-
-    fn streamImpl(r: *std.io.Reader, w: *std.io.Writer, limit: std.io.Limit) std.io.Reader.StreamError!usize {
+    fn streamImpl(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         std.debug.assert(limit == .unlimited);
-
         const self: *Self = @fieldParentPtr("reader", r);
-
         if (self.state == .ended) {
             return error.EndOfStream;
         }
-
-        //while (true) {
-        //    const b = try self.readBit();
-        //    std.debug.print("{}", .{b});
-        //}
-
-        defer std.debug.print("\n", .{});
-    
-        const isFinal = try self.readBit() != 0;
-        const blockType = self.readUint(2) catch return error.ReadFailed;
- 
-        if (isFinal) 
-            self.state = .ended;
-
-        std.debug.print("isFinal: {}, type {b:02}\n", .{isFinal, blockType});
-
-        if (blockType == 0) {
-            self.byteAlign();
-            const len = self.input.takeInt(u16, .little) catch return error.ReadFailed;
-            const nlen = self.input.takeInt(u16, .little) catch return error.ReadFailed;
-            std.debug.print("{} {}\n", .{len, nlen});
-            // TODO
-            if (len ^ nlen != 0xFFFF)
+        if (self.state == .invalid) {
+            return error.ReadFailed;
+        }
+        return self.processSingleBlock(w) catch |err| switch (err) {
+            // TODO handle errors in a smart way???
+            error.EndOfStream => {
+                self.state = .invalid;
                 return error.ReadFailed;
-            // TODO
-            self.input.streamExact(w, len) catch return error.ReadFailed;
-            return len;
+            },
+            else => {
+                self.state = .invalid;
+                return error.ReadFailed;
+            }
+        };
+    }
+
+    fn processSingleBlock(self: *Self, w: *std.io.Writer) !usize {
+        const is_final = try self.bit_reader.takeUint(self.input, u1) != 0;
+        if (is_final) {
+            // we trust this flag and didn't verify if that's the case
+            self.state = .ended;
+        }
+        const block_type_num = try self.bit_reader.takeUint(self.input, u2);
+        const block_type = std.enums.fromInt(BlockType, block_type_num) orelse return error.InvalidBlockType;
+
+        switch (block_type) {
+            .stored => {
+                self.bit_reader.byteAlignDiscarding();
+                const len = self.input.takeInt(u16, .little) catch return error.InvalidBlockHeader;
+                const nlen = self.input.takeInt(u16, .little) catch return error.InvalidBlockHeader;
+
+                if (len != ~nlen)
+                    return error.InvalidBlockHeader;
+
+                try self.writeStreaming(w, len);
+                // self.bit_reader.informBytesSkippedExternaly(len);
+                return len;
+            },
+            .static => {
+                self.lit_tree.initLitStatic();
+                self.dist_tree.initDistStatic();
+            },
+            .dynamic => {
+                try self.readDynamicBlockHuffmanTrees();
+            },
         }
 
-        if (blockType == 0b01) {
-            self.huffman_tree.loadStatic();
-            self.huffman_tree.debugDump();
-        } else {
-            self.readHuffmanTree() catch return error.ReadFailed;
-        }
-
+        // TODO handle error.EndOfStream
+        return self.decodeBlockCode(w);
+    }
+    
+    fn decodeBlockCode(self: *Self, w: *std.io.Writer) !usize {
+        var written: usize = 0;
         while (true) {
-            //const symbol = try self.readBit();
-            const sym = try self.readHuffmanCodeSymbol();
-            std.debug.print("SYM: {}\n", .{sym});
+            const sym = try self.lit_tree.readSymbol(&self.bit_reader, self.input);
             if (sym < 256) {
-                // TODO
+                try self.writeByte(w, @intCast(sym));
+                written += 1;
                 continue;
             }
             if (sym == 256)
                 break;
+            if (sym >= 286)
+                return error.InvalidSymbolUsed;
          
-            const len_extra = try self.readUint(LEN_SYM_EXTRA_BITS[sym - 257]) + LEN_SYM_OFFSETS[sym - 257];
-            const dist_code = try self.readUint(5);
-            const dist = try self.readUint(DIST_SYM_EXTRA_BITS[dist_code]) + DIST_SYM_OFFSETS[dist_code];
+            const len_extra = try self.bit_reader.takeBits(self.input, LIT_SYM_EXTRA_BITS[sym - 257]);
+            const len = len_extra + LIT_SYM_OFFSETS[sym - 257];
+            const dist_sym = try self.dist_tree.readSymbol(&self.bit_reader, self.input);
+            const dist_extra = try self.bit_reader.takeBits(self.input, DIST_SYM_EXTRA_BITS[dist_sym]);
+            const dist = dist_extra + DIST_SYM_OFFSETS[dist_sym];
 
-            std.debug.print("len={} dist={}\n", .{len_extra, dist});
+            // TODO make that smarter
+            for (0..len) |_| {
+                const index = (self.buf_end + FLATE_BUF_LEN - dist) & (FLATE_BUF_LEN - 1);
+                try self.writeByte(w, self.buf[index]);
+                written += 1;
+            }
+
         }
-
-        //return self.reader.stream(w, limit);
-        return 0;
+        return written;
     }
 };
