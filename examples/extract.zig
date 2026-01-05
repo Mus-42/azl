@@ -30,7 +30,7 @@ pub fn main() !void {
     defer file.close();
     
     // TODO
-    var buf: [256]u8 = undefined;
+    var buf: [8192]u8 = undefined;
     var reader = file.reader(&buf);
     var iter = try azl.zipReader(&reader);
 

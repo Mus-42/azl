@@ -31,8 +31,10 @@ pub fn main() !void {
     const file = try std.fs.cwd().createFile(archive_filename, .{});
     defer file.close();
 
-    var buf_writer = std.io.bufferedWriter(file.writer());
-    var zip_writer = try azl.zipWriter(alloc, buf_writer.writer());
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(&buf);
+
+    var zip_writer = try azl.ZipWriter.init(alloc, &writer.interface);
     defer zip_writer.deinit();
 
     while (try dir_iter.next()) |entry| {
@@ -48,5 +50,4 @@ pub fn main() !void {
         try zip_writer.addFile(file_data, .{ .filename = entry.path });
     }
     try zip_writer.finish();
-    try buf_writer.flush();
 }

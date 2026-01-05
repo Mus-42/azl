@@ -42,16 +42,20 @@ const BitReader = struct {
     fn peekBits(self: *Self, input: *std.io.Reader, count: u4) !u16 {
         if (count == 0) return 0;
         while (count > self.buffered_count) {
-            const pos = self.buffered_count >> 3;
-            const byte = if (input.peek(pos+1)) |slice| slice[pos] else |err| switch (err) {
-                // handle EoS as zeros
-                // for trusted files that part would be newer used
-                error.EndOfStream => 0,
-                else => return err,
+            const buf = self.buffered_count;
+            const pos = buf >> 3;
+            self.buffered_count += 8;
+            const byte = if (input.peek(pos+1)) |slice| slice[pos] else |err| {
+                @branchHint(.unlikely);
+                switch (err) {
+                    // handle EoS as zeros
+                    // for trusted files that part would be newer used
+                    error.EndOfStream => continue,
+                    else => return err,
+                }
             };
             // std.debug.print("0x{X:0}\n", .{byte});
-            self.buffered |= @as(u32, byte) << self.buffered_count;
-            self.buffered_count += 8;
+            self.buffered |= @as(u32, byte) << buf;
         }
         const ret = self.buffered & ((@as(u32, 1)<<count)-1);
         // std.debug.print("{b:0<[1]}\n", .{ret, count});
@@ -74,12 +78,14 @@ const LitHuffmanTree = HuffmanTree(286, 15);
 // Distance codes tree
 const DistHuffmanTree = HuffmanTree(30, 15);
 // Code lengths tree
-const CodeLenHuffmanTree = HuffmanTree(19, 15);
+const CodeLenHuffmanTree = HuffmanTree(19, 7);
 
 fn HuffmanTree(comptime max_nodes: usize, comptime max_code_bits: u4) type {
     return struct {
         nodes: [max_nodes]TreeNode,
-        len_counts: [max_code_bits]u15,
+        len_sub_max: u4,
+        len_min: u4,
+        len_counts: [max_code_bits]u16,
         len_lookup: [max_code_bits]u16,
 
         const TreeNode = packed struct {
@@ -118,7 +124,7 @@ fn HuffmanTree(comptime max_nodes: usize, comptime max_code_bits: u4) type {
             }
             self.orderNodes();
             self.updateLenCounts();
-            // Symbols 286-287 participate in code consturction but not present in actual tree
+            // Symbols 286-287 (len 8) participate in code consturction but not present in actual tree
             self.len_counts[8-1] += 2;
             self.rebuildCodesFromLengths();
             self.len_counts[8-1] -= 2;
@@ -158,10 +164,23 @@ fn HuffmanTree(comptime max_nodes: usize, comptime max_code_bits: u4) type {
                     self.len_counts[node.code_len - 1] += 1;
                 }
             }
+            for (0..max_code_bits) |i| {
+                const k = max_code_bits - 1 - i;
+                if (self.len_counts[k] != 0) {
+                    self.len_sub_max = @intCast(i);
+                    break;
+                }
+            }
+            for (0..max_code_bits) |i| {
+                if (self.len_counts[i] != 0) {
+                    self.len_min = @intCast(i);
+                    break;
+                }
+            }
         }
 
         fn rebuildCodesFromLengths(self: *Self) void {
-            var code: u15 = 0;
+            var code: u16 = 0;
             var next_code: [max_code_bits]u16 = @splat(0);
             for (1..max_code_bits) |bits| {
                 code += self.len_counts[bits-1];
@@ -207,28 +226,36 @@ fn HuffmanTree(comptime max_nodes: usize, comptime max_code_bits: u4) type {
         }
 
         fn readSymbol(self: *Self, bit_reader: *BitReader, input: *std.Io.Reader) !u15 {
-            const U = std.meta.Int(.unsigned, max_code_bits);
-            var code = @bitReverse(@as(U, @intCast(try bit_reader.peekBits(input, max_code_bits))));
-            var code_bits = max_code_bits;
-            const code0 = code;
-            while (code_bits > 0) : ({
-                code_bits -= 1;
-                code >>= 1;
-            }) {
-                const len = self.len_counts[code_bits-1];
+            const code_len = max_code_bits - self.len_sub_max;
+            var code = @bitReverse(try bit_reader.peekBits(input, code_len));
+            code >>= @intCast(@as(u16, 16) - code_len);
+            const node_index = try self.lookupSymbolNodeIndex(code, code_len);
+            bit_reader.tossBits(input, @intCast(self.nodes[node_index].code_len));
+            return self.nodes[node_index].symbol;
+        }
+
+        fn lookupSymbolNodeIndex(self: *Self, code: u16, code_len: u4) !u16 {
+            // TODO some kind of smart lookup for short codes here???
+            return self.lookupSymbolNodeIndexFull(code, code_len);
+        }
+
+        fn lookupSymbolNodeIndexFull(self: *Self, code: u16, code_len: u4) !u16 {
+            if (self.len_min >= code_len) 
+                return error.InvalidHuffmanCode;
+
+            for (self.len_min..code_len) |i| {
+                const len = self.len_counts[i];
                 if (len == 0) continue;
-                const i = self.len_lookup[code_bits-1];
-                const min_code = self.nodes[i].code;
-                if (min_code <= code and code - min_code < len) {
-                    bit_reader.tossBits(input, code_bits);
-                    const index = i + code - min_code;
-                    std.debug.assert(self.nodes[index].code == code);
-                    const sym = self.nodes[index].symbol;
-                    // std.debug.print("code -> {b:0<[1]}, sym -> {[2]}\n", .{code, code_bits, sym});
-                    return sym;
+                const code_i = code >> @intCast(code_len - i - 1);
+                const j = self.len_lookup[i];
+                const min_code = self.nodes[j].code;
+                if (min_code <= code_i and code_i - min_code < len) {
+                    const index = j + code_i - min_code;
+                    std.debug.assert(self.nodes[index].code == code_i);
+                    return index;
                 }
             }
-            std.debug.print("code0 -> {b:0<[1]}\n", .{code0, max_code_bits});
+
             return error.InvalidHuffmanCode;
         }
     };
@@ -241,10 +268,11 @@ const BlockType = enum (u2) {
 };
 
 pub const Decompressor = struct {
-    reader: std.Io.Reader,
+    interface: std.Io.Reader,
     input: *std.Io.Reader,
     bit_reader: BitReader = .{},
 
+    // TODO rename to something
     buf_end: usize = 0,
     buf: []u8,
 
@@ -266,7 +294,7 @@ pub const Decompressor = struct {
         std.debug.assert(input.buffer.len > 0);
 
         return .{
-            .reader = .{
+            .interface = .{
                 .vtable = &.{
                     .stream = streamImpl,
                 },
@@ -292,6 +320,7 @@ pub const Decompressor = struct {
         for (0..n_code_len) |i| {
             code_len_lengths[LEN_ORDER[i]] = try self.bit_reader.takeUint(self.input, u3);
         }
+
         var code_len_tree: CodeLenHuffmanTree = undefined;
         code_len_tree.init(&code_len_lengths);
 
@@ -313,10 +342,9 @@ pub const Decompressor = struct {
                 i += @as(usize, try self.bit_reader.takeUint(self.input, u7)) + 11;
                 continue;
             }
-
-            const num = @as(usize, try self.bit_reader.takeUint(self.input, u2)) + 3;
             if (i == 0) 
                 return error.InvalidBlockHeader;
+            const num = @as(usize, try self.bit_reader.takeUint(self.input, u2)) + 3;
             const val = code_len[i-1];
             for (0..@min(num, code_len.len-i)) |_| {
                 code_len[i] = val;
@@ -347,9 +375,9 @@ pub const Decompressor = struct {
 
     fn writeStreaming(self: *Self, w: *std.Io.Writer, limit: usize) !void {
         var remaining = limit;
-        if (limit > FLATE_BUF_LEN) {
+        if (remaining > FLATE_BUF_LEN) {
+            try self.input.streamExact(w, remaining - FLATE_BUF_LEN);
             remaining = FLATE_BUF_LEN;
-            try self.input.streamExact(w, limit - FLATE_BUF_LEN);
         }
         
         while (remaining != 0) {
@@ -362,7 +390,7 @@ pub const Decompressor = struct {
 
     fn streamImpl(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         std.debug.assert(limit == .unlimited);
-        const self: *Self = @fieldParentPtr("reader", r);
+        const self: *Self = @fieldParentPtr("interface", r);
         if (self.state == .ended) {
             return error.EndOfStream;
         }
@@ -447,4 +475,9 @@ pub const Decompressor = struct {
         }
         return written;
     }
+};
+
+const Compressor = struct {
+    sink: *std.io.Writer,
+    interface: std.Io.Writer,
 };
