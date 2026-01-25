@@ -1,6 +1,9 @@
 const std = @import("std");
+const Alloc = std.mem.Allocator;
 
 pub const FLATE_BUF_LEN = 32 * 1024;
+
+const FLATE_MAX_BLOCK_LEN = 1<<16;
 
 const LIT_SYM_EXTRA_BITS: [30]u4 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0, 0 };
 const LIT_SYM_OFFSETS: [30]u16 = .{ 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258, 0 };
@@ -8,21 +11,13 @@ const LIT_SYM_OFFSETS: [30]u16 = .{ 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19,
 const DIST_SYM_EXTRA_BITS: [30]u4 =.{ 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
 const DIST_SYM_OFFSETS: [30]u16 = .{ 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
 
+const DYNAMIC_HC_LEN_CODES_LEN_ORDER: [19]u8 = .{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+
 const BitReader = struct {
     buffered: u32 = 0,
     buffered_count: u5 = 0,
 
     const Self = @This();
-
-    fn informBytesSkippedExternaly(self: *Self, count: usize) void {
-        if (count * 8 >= self.buffered_count) {
-            self.buffered = 0;
-            self.buffered_count = 0;
-            return;
-        }
-        self.buffered >>= @intCast(count * 8);
-        self.buffered_count -= @intCast(count * 8);
-    }
 
     fn byteAlignDiscarding(self: *Self) void {
         self.buffered_count = 0;
@@ -72,6 +67,41 @@ const BitReader = struct {
         self.buffered >>= count;
     }
 };
+
+const BitWriter = struct {
+    buffered: u32 = 0,
+    buffered_count: u5 = 0,
+
+    const Self = @This();
+    
+    /// flush all remaining bits and align to byte boundry
+    fn flushByteAligned(self: *Self, sink: *std.io.Writer) !void {
+        // round to next multiple of 8
+        self.buffered_count = (self.buffered_count + 7) & ~@as(u5, 0b11);
+        try self.partialFlushBuffered(sink);
+        self.buffered_count = 0;
+        self.buffered = 0;
+    }
+
+    fn writeBits(self: *Self, sink: *std.io.Writer, bits: u16, count: u4) !void {
+        self.buffered |= @as(u32, bits) << self.buffered_count;
+        self.buffered_count += count;
+        try self.partialFlushBuffered(sink);
+    }
+
+    fn writeUint(self: *Self, sink: *std.io.Writer, comptime U: type, bits: U) !void {
+        return try self.writeBits(sink, bits, @intCast(@bitSizeOf(U)));
+    }
+
+    fn partialFlushBuffered(self: *Self, sink: *std.io.Writer) !void {
+        while (self.buffered_count >= 8) {
+            try sink.writeByte(@intCast(self.buffered & 0xFF));
+            self.buffered_count -= 8;
+            self.buffered >>= 8;
+        }
+    }
+};
+
 
 // Literal/length codes tree
 const LitHuffmanTree = HuffmanTree(286, 15);
@@ -258,6 +288,18 @@ fn HuffmanTree(comptime max_nodes: usize, comptime max_code_bits: u4) type {
 
             return error.InvalidHuffmanCode;
         }
+
+        // TODO make make it faster
+        fn writeSymbol(self: *Self, bit_writer: *BitWriter, sink: *std.Io.Writer, symbol: u9) !void {
+            for (&self.nodes) |node| {
+                if (node.symbol != symbol) {
+                    continue;
+                }
+                try bit_writer.writeBits(sink, @bitReverse(node.code) >> (15 - node.code_len), node.code_len);
+                return;
+            }
+            return error.InvalidHuffmanTreeSymbol;
+        }
     };
 }
 
@@ -267,14 +309,14 @@ const BlockType = enum (u2) {
     dynamic = 0b10,
 };
 
-pub const Decompressor = struct {
-    interface: std.Io.Reader,
+const Decompressor = struct {
+    // interface: std.Io.Reader,
     input: *std.Io.Reader,
     bit_reader: BitReader = .{},
 
     // TODO rename to something
     buf_end: usize = 0,
-    buf: []u8,
+    buf: *[FLATE_BUF_LEN]u8,
 
     lit_tree: LitHuffmanTree = undefined,
     dist_tree: DistHuffmanTree = undefined,
@@ -289,19 +331,10 @@ pub const Decompressor = struct {
         invalid,
     };
 
-    pub fn init(input: *std.Io.Reader, buf: []u8) Self {
-        std.debug.assert(buf.len == FLATE_BUF_LEN);
+    fn init(input: *std.Io.Reader, buf: *[FLATE_BUF_LEN]u8) Self {
         std.debug.assert(input.buffer.len > 0);
 
         return .{
-            .interface = .{
-                .vtable = &.{
-                    .stream = streamImpl,
-                },
-                .buffer = &.{},
-                .seek = 0,
-                .end = 0,
-            },
             .input = input,
             .buf = buf,
         };
@@ -315,10 +348,9 @@ pub const Decompressor = struct {
         if (n_code_len > 19 or n_dist > 30 or n_lit > 286)
             return error.InvalidCodeLen;
 
-        const LEN_ORDER: [19]u8 = .{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
         var code_len_lengths: [19]u4 = @splat(0);
-        for (0..n_code_len) |i| {
-            code_len_lengths[LEN_ORDER[i]] = try self.bit_reader.takeUint(self.input, u3);
+        for (DYNAMIC_HC_LEN_CODES_LEN_ORDER[0..n_code_len]) |i| {
+            code_len_lengths[i] = try self.bit_reader.takeUint(self.input, u3);
         }
 
         var code_len_tree: CodeLenHuffmanTree = undefined;
@@ -373,6 +405,7 @@ pub const Decompressor = struct {
         return slice;
     }
 
+    // TODO rename to something like "pipe" or idk
     fn writeStreaming(self: *Self, w: *std.Io.Writer, limit: usize) !void {
         var remaining = limit;
         if (remaining > FLATE_BUF_LEN) {
@@ -388,26 +421,34 @@ pub const Decompressor = struct {
         }
     }
 
-    fn streamImpl(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        std.debug.assert(limit == .unlimited);
-        const self: *Self = @fieldParentPtr("interface", r);
-        if (self.state == .ended) {
-            return error.EndOfStream;
+    // fn streamImpl(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    //     std.debug.assert(limit == .unlimited);
+    //     const self: *Self = @fieldParentPtr("interface", r);
+    //     if (self.state == .ended) {
+    //         return error.EndOfStream;
+    //     }
+    //     if (self.state == .invalid) {
+    //         return error.ReadFailed;
+    //     }
+    //     return self.processSingleBlock(w) catch |err| switch (err) {
+    //         // TODO handle errors in a smart way???
+    //         error.EndOfStream => {
+    //             self.state = .invalid;
+    //             return error.ReadFailed;
+    //         },
+    //         else => {
+    //             self.state = .invalid;
+    //             return error.ReadFailed;
+    //         }
+    //     };
+    // }
+
+    fn processWholeStream(self: *Self, w: *std.io.Writer) !usize {
+        var total_size: usize = 0;
+        while (self.state == .reading) {
+            total_size += try self.processSingleBlock(w);
         }
-        if (self.state == .invalid) {
-            return error.ReadFailed;
-        }
-        return self.processSingleBlock(w) catch |err| switch (err) {
-            // TODO handle errors in a smart way???
-            error.EndOfStream => {
-                self.state = .invalid;
-                return error.ReadFailed;
-            },
-            else => {
-                self.state = .invalid;
-                return error.ReadFailed;
-            }
-        };
+        return total_size;
     }
 
     fn processSingleBlock(self: *Self, w: *std.io.Writer) !usize {
@@ -421,7 +462,6 @@ pub const Decompressor = struct {
 
         switch (block_type) {
             .stored => {
-                self.bit_reader.byteAlignDiscarding();
                 const len = self.input.takeInt(u16, .little) catch return error.InvalidBlockHeader;
                 const nlen = self.input.takeInt(u16, .little) catch return error.InvalidBlockHeader;
 
@@ -429,7 +469,7 @@ pub const Decompressor = struct {
                     return error.InvalidBlockHeader;
 
                 try self.writeStreaming(w, len);
-                // self.bit_reader.informBytesSkippedExternaly(len);
+                self.bit_reader.byteAlignDiscarding();
                 return len;
             },
             .static => {
@@ -465,19 +505,170 @@ pub const Decompressor = struct {
             const dist_extra = try self.bit_reader.takeBits(self.input, DIST_SYM_EXTRA_BITS[dist_sym]);
             const dist = dist_extra + DIST_SYM_OFFSETS[dist_sym];
 
+            if (dist > FLATE_BUF_LEN)
+                return error.InvalidBufferLen;
+
             // TODO make that smarter
             for (0..len) |_| {
                 const index = (self.buf_end + FLATE_BUF_LEN - dist) & (FLATE_BUF_LEN - 1);
                 try self.writeByte(w, self.buf[index]);
                 written += 1;
             }
-
         }
         return written;
     }
 };
 
+/// decompresses flate stream until stream reaches final block or error is returned
+pub fn decompress(source: *std.io.Reader, sink: *std.io.Writer, buf: *[FLATE_BUF_LEN]u8) !usize {
+    var dec: Decompressor = .init(source, buf);
+    return try dec.processWholeStream(sink);
+}
+
 const Compressor = struct {
+    alloc: Alloc,
+    data: []const u8,
+    lit_count: [286]u16 = @splat(0),
+    dist_count: [30]u16 = @splat(0),
     sink: *std.io.Writer,
-    interface: std.Io.Writer,
+    bit_writer: BitWriter = .{},
+    lit_tree: LitHuffmanTree = undefined,
+    dist_tree: DistHuffmanTree = undefined,
+
+    const Self = @This();
+
+    fn init(alloc: Alloc, sink: *std.io.Writer, data: []const u8) Self {
+        return .{
+            .alloc = alloc,
+            .data = data,
+            .sink = sink,
+        };
+    }
+
+    const Match = struct {
+        len: u16,
+        dist: u16,
+    };
+
+    fn tryFindMatch(self: *Self, position: usize) ?Match {
+        // for k in 3..
+        // start in @max(0, pos-MAX_LOOKBACK)..pos+k-1
+        // end = start + k
+
+        _ = position;
+        _ = self;
+        // TODO
+        return null;
+    }
+
+    fn lenToSym(len: u16) u16 {
+        for (0.., LIT_SYM_OFFSETS[1..]) |i, sym_offset| {
+            if (len > sym_offset) {
+                return i + 257;
+            }
+        }
+        return 30 + 257;
+    }
+
+    fn distToSym(dist: u16) u16 {
+        for (0.., DIST_SYM_OFFSETS[1..]) |i, sym_offset| {
+            if (dist > sym_offset) {
+                return i;
+            }
+        }
+        return 30;
+    }
+
+    // compress [start, end) chunk of data
+    fn compressBlock(self: *Self, bl_start: usize, bl_end: usize, is_final: bool) !void {
+        var block_type: BlockType = .static;
+        _ = &block_type;
+        // self.cursor = 0;
+        // self.lit_count = @splat(0);
+        // self.dist_count = @splat(0);
+        // self.sym_count[256] = 1;
+        // while (self.cursor < self.data.len) {
+        //     if (self.tryFindMatch()) |match| {
+        //         const lit_sym = lenToSym(match.len);
+        //         const dist_sym = distToSym(match.dist);
+        //         self.lit_count[lit_sym] += 1;
+        //         self.dist_count[dist_sym] += 1;
+        //         self.cursor += match.len;
+        //     } else {
+        //         self.lit_count[self.data[self.cursor]] += 1;
+        //         self.cursor += 1;
+        //     }
+        // }
+        // TODO decide between stored/static/dynamic
+
+
+        try self.bit_writer.writeUint(self.sink, u1, @intFromBool(is_final));
+        try self.bit_writer.writeUint(self.sink, u2, @intFromEnum(block_type));
+
+        switch (block_type) {
+            .stored => {
+                @panic("TODO");
+            },
+            .static => {
+                self.lit_tree.initLitStatic();
+                self.dist_tree.initDistStatic();
+            },
+            .dynamic => {
+                @panic("TODO");
+            },
+        }
+
+        var cursor = bl_start;
+        while (cursor < bl_end) {
+            if (self.tryFindMatch(cursor)) |match| {
+                _ = match;
+                @panic("TODO");
+            }
+            try self.lit_tree.writeSymbol(&self.bit_writer, self.sink, self.data[cursor]);
+            cursor += 1;
+        }
+        // end of block
+        try self.lit_tree.writeSymbol(&self.bit_writer, self.sink, 256);
+    }
+
+    fn compressWholeData(self: *Self) !void {
+        var i: usize = 0;
+        while (i < self.data.len) {
+            const beg = i;
+            i += FLATE_MAX_BLOCK_LEN;
+            const is_final = i >= self.data.len;
+            try self.compressBlock(beg, @min(i, self.data.len), is_final);
+        }
+        try self.bit_writer.flushByteAligned(self.sink);
+    }
 };
+
+
+/// compresses data into flate stream
+/// limitations: data should be fully read into memory
+pub fn compress(data: []const u8, sink: *std.io.Writer, alloc: Alloc) !void {
+    // const MIN_K = 3;
+    // var i: usize = 0;
+    // while (i < data.len) {
+    //     var last_i: ?usize = null;
+    //     var k: usize = MIN_K;
+    //     const max_k = data.len-i;
+    //     while (k <= max_k) : (k += 1) {
+    //         const last_index = std.mem.lastIndexOf(u8, data[0..i+k-1], data[i..i+k]);
+    //         if (last_index == null) break;
+    //         last_i = last_index;
+    //     }
+    //     if (last_i != null) {
+    //         try sink.print("[{}..][0..{}]\n", .{last_i.?, k});
+    //         i += k;
+    //     } else {
+    //         try sink.print("'{}'\n", .{data[i]});
+    //         i += 1;
+    //     }
+    // }
+    // return 0;
+    //
+    var comp: Compressor = .init(alloc, sink, data);
+    try comp.compressWholeData();
+    
+}

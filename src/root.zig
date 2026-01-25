@@ -1,5 +1,5 @@
 const std = @import("std");
-const flate = @import("flate.zig");
+pub const flate = @import("flate.zig");
 const Alloc = std.mem.Allocator;
 
 pub const CompressionMethod = enum(u16) {
@@ -220,8 +220,9 @@ pub fn ZipReader(comptime SeekableStream: type) type {
                     uncompressed_size = @intCast(try limited.interface.streamRemaining(&sink.writer));
                 },
                 .deflate => {
-                    var decompress: flate.Decompressor = .init(&limited.interface, &big_buf.decompress_buf);
-                    uncompressed_size = @intCast(try decompress.interface.streamRemaining(&sink.writer));
+                    uncompressed_size = @intCast(try flate.decompress(&limited.interface, &sink.writer, &big_buf.decompress_buf));
+                    // var decompress: flate.Decompressor = .init(&limited.interface, &big_buf.decompress_buf);
+                    // uncompressed_size = @intCast(try decompress.interface.streamRemaining(&sink.writer));
                 },
                 _ => unreachable,
             }
@@ -230,7 +231,6 @@ pub fn ZipReader(comptime SeekableStream: type) type {
 
             if (uncompressed_size != entry.uncompressed_size)
                 return error.ZipFileSizeMissmatch;
-        
     
             const final_crc = sink.hasher.final();
             if (final_crc != entry.crc_32)
@@ -255,7 +255,7 @@ pub const ZipWriter = struct {
     alloc: Alloc,
     writer: *std.Io.Writer,
     cd_entries: std.ArrayList(CDEntry),
-    compression_buf: std.ArrayList(u8),
+    compression_buf: std.Io.Writer.Allocating,
     file_pos: u64 = 0,
 
     const CDEntry = struct {
@@ -275,8 +275,8 @@ pub const ZipWriter = struct {
         return .{
             .alloc = alloc,
             .writer = writer,
-            .cd_entries = std.ArrayList(CDEntry).empty,
-            .compression_buf = std.ArrayList(u8).empty,
+            .cd_entries = .empty,
+            .compression_buf = .init(alloc),
         };
     }
 
@@ -298,8 +298,8 @@ pub const ZipWriter = struct {
 
         const compressed = if (options.compression_method == .deflate) blk: {
             self.compression_buf.clearRetainingCapacity();
-            // TODO compress into buf
-            break :blk self.compression_buf.items;
+            try flate.compress(filedata, &self.compression_buf.writer, self.alloc);
+            break :blk self.compression_buf.written();
         } else filedata;
 
         const crc_32 = std.hash.Crc32.hash(filedata);
@@ -387,6 +387,6 @@ pub const ZipWriter = struct {
             self.alloc.free(entry.filename);
         }
         self.cd_entries.deinit(self.alloc); 
-        self.compression_buf.deinit(self.alloc); 
+        self.compression_buf.deinit(); 
     }
 };
