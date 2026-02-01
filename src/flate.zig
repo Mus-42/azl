@@ -1,9 +1,11 @@
 const std = @import("std");
 const Alloc = std.mem.Allocator;
+pub const sa = @import("suffix_array.zig");
 
-pub const FLATE_BUF_LEN = 32 * 1024;
-
-const FLATE_MAX_BLOCK_LEN = 1<<16;
+pub const FLATE_MAX_LOOKBACK_DIST = 32 * 1024;
+pub const FLATE_MAX_LOOKBACK_LEN = 258;
+pub const FLATE_BUF_LEN = FLATE_MAX_LOOKBACK_DIST;
+pub const FLATE_MAX_BLOCK_LEN = 1<<16;
 
 const LIT_SYM_EXTRA_BITS: [30]u4 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0, 0 };
 const LIT_SYM_OFFSETS: [30]u16 = .{ 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258, 0 };
@@ -526,23 +528,37 @@ pub fn decompress(source: *std.io.Reader, sink: *std.io.Writer, buf: *[FLATE_BUF
 }
 
 const Compressor = struct {
-    alloc: Alloc,
-    data: []const u8,
+    sa_builder: sa.SuffixArrayBuilder,
     lit_count: [286]u16 = @splat(0),
     dist_count: [30]u16 = @splat(0),
-    sink: *std.io.Writer,
+    sink: *std.io.Writer = undefined,
     bit_writer: BitWriter = .{},
     lit_tree: LitHuffmanTree = undefined,
     dist_tree: DistHuffmanTree = undefined,
 
+    pub const BlockContext = struct {
+        data: []const u8,
+        bl_start: u32,
+        bl_end: u32,
+        sa: []const u32 = undefined,
+        lcp: []const u32 = undefined,
+        rev_sa: []const u32 = undefined,
+        lookup_start: u32 = undefined,
+    };
+
     const Self = @This();
 
-    fn init(alloc: Alloc, sink: *std.io.Writer, data: []const u8) Self {
-        return .{
-            .alloc = alloc,
-            .data = data,
-            .sink = sink,
+    fn init(alloc: Alloc) !Self {
+        var sa_builder: sa.SuffixArrayBuilder = try .init(alloc);
+        errdefer sa_builder.deinit(alloc);
+
+        return .{ 
+            .sa_builder = sa_builder,
         };
+    }
+
+    fn deinit(self: *Self, alloc: Alloc) void {
+        self.sa_builder.deinit(alloc);
     }
 
     const Match = struct {
@@ -550,37 +566,97 @@ const Compressor = struct {
         dist: u16,
     };
 
-    fn tryFindMatch(self: *Self, position: usize) ?Match {
-        // for k in 3..
-        // start in @max(0, pos-MAX_LOOKBACK)..pos+k-1
-        // end = start + k
-
-        _ = position;
+    fn tryFindMatch(self: *Self, ctx: BlockContext, position: u32) ?Match {
         _ = self;
-        // TODO
-        return null;
+
+        const pos = position - ctx.lookup_start;
+        const sa_index = ctx.rev_sa[pos];
+
+        const MIN_MATCH_LEN = 3;
+
+        var best_match_pos: u32 = 0;
+        var best_match_len: u32 = 0;
+
+        const max_match_len: u32 = @intCast(@min(ctx.bl_end - position, FLATE_MAX_LOOKBACK_LEN));
+
+        var i = sa_index;
+        var i_match_len: u32 = max_match_len;
+        while (i > 0) {
+            i -= 1;
+            i_match_len = @min(ctx.lcp[i], i_match_len);
+            if (i_match_len < best_match_len or i_match_len < MIN_MATCH_LEN) break;
+            if (ctx.sa[i] < pos) {
+                if (best_match_len == i_match_len) {
+                    best_match_pos = @max(best_match_pos, ctx.sa[i]);
+                } else {
+                    best_match_pos = ctx.sa[i];
+                }
+                best_match_len = i_match_len;
+            }
+        }
+        i = sa_index;
+        i_match_len = max_match_len;
+        while (i < ctx.lcp.len) {
+            i_match_len = @min(ctx.lcp[i], i_match_len);
+            i += 1;
+            if (i_match_len < best_match_len or i_match_len < MIN_MATCH_LEN) break;
+            if (ctx.sa[i] < pos) {
+                if (best_match_len == i_match_len) {
+                    best_match_pos = @max(best_match_pos, ctx.sa[i]);
+                } else {
+                    best_match_pos = ctx.sa[i];
+                }
+                best_match_len = i_match_len;
+            }
+        }
+
+        if (best_match_len < MIN_MATCH_LEN or best_match_pos + FLATE_MAX_BLOCK_LEN <= pos) {
+            return null;
+        }
+
+        // std.debug.assert(std.mem.eql(u8, ctx.data[ctx.lookup_start+best_match_pos..][0..best_match_len], ctx.data[position..][0..best_match_len]));
+
+        return .{
+            .len = @intCast(best_match_len),
+            .dist = @intCast(pos - best_match_pos),
+        };
     }
 
     fn lenToSym(len: u16) u16 {
-        for (0.., LIT_SYM_OFFSETS[1..]) |i, sym_offset| {
-            if (len > sym_offset) {
-                return i + 257;
+        for (0.., LIT_SYM_OFFSETS[1..29]) |i, sym_offset| {
+            if (len < sym_offset) {
+                return @intCast(i + 257);
             }
         }
-        return 30 + 257;
+        return 28 + 257;
     }
 
     fn distToSym(dist: u16) u16 {
         for (0.., DIST_SYM_OFFSETS[1..]) |i, sym_offset| {
-            if (dist > sym_offset) {
-                return i;
+            if (dist < sym_offset) {
+                return @intCast(i);
             }
         }
-        return 30;
+        return 29;
     }
 
     // compress [start, end) chunk of data
-    fn compressBlock(self: *Self, bl_start: usize, bl_end: usize, is_final: bool) !void {
+    fn compressBlock(
+        self: *Self,
+        sink: *std.Io.Writer,
+        block_context: BlockContext,
+        is_final: bool
+    ) !void {
+        const data = block_context.data;
+        var ctx = block_context;
+        const lookup_start = block_context.bl_start -| FLATE_MAX_LOOKBACK_DIST;
+        ctx.lookup_start = lookup_start;
+        ctx.sa = self.sa_builder.constructSuffixArray(data[lookup_start..ctx.bl_end]);
+        ctx.lcp = self.sa_builder.constructLcp(data[lookup_start..ctx.bl_end], ctx.sa);
+        ctx.rev_sa = self.sa_builder.constructRevSa(ctx.sa);
+        
+        // TODO use SA       
+
         var block_type: BlockType = .static;
         _ = &block_type;
         // self.cursor = 0;
@@ -602,8 +678,8 @@ const Compressor = struct {
         // TODO decide between stored/static/dynamic
 
 
-        try self.bit_writer.writeUint(self.sink, u1, @intFromBool(is_final));
-        try self.bit_writer.writeUint(self.sink, u2, @intFromEnum(block_type));
+        try self.bit_writer.writeUint(sink, u1, @intFromBool(is_final));
+        try self.bit_writer.writeUint(sink, u2, @intFromEnum(block_type));
 
         switch (block_type) {
             .stored => {
@@ -618,28 +694,56 @@ const Compressor = struct {
             },
         }
 
-        var cursor = bl_start;
-        while (cursor < bl_end) {
-            if (self.tryFindMatch(cursor)) |match| {
-                _ = match;
-                @panic("TODO");
+        var cursor = ctx.bl_start;
+        while (cursor < ctx.bl_end) {
+            if (self.tryFindMatch(ctx, cursor)) |match| {
+                const lit_sym = lenToSym(match.len);
+                const dist_sym = distToSym(match.dist);
+                
+                const approx_len = @as(u32, 24) + LIT_SYM_EXTRA_BITS[lit_sym - 257] + DIST_SYM_EXTRA_BITS[dist_sym];
+                if (approx_len < match.len * 8) {
+                    const len_extra = match.len - LIT_SYM_OFFSETS[lit_sym - 257];
+                    const dist_extra = match.dist - DIST_SYM_OFFSETS[dist_sym];
+
+                    const len_bits = LIT_SYM_EXTRA_BITS[lit_sym - 257];
+                    const dist_bits = DIST_SYM_EXTRA_BITS[dist_sym];
+
+
+                    try self.lit_tree.writeSymbol(&self.bit_writer, sink, @intCast(lit_sym));
+                    if (len_bits > 0) {
+                        try self.bit_writer.writeBits(sink, len_extra, len_bits);
+                    }
+                    try self.dist_tree.writeSymbol(&self.bit_writer, sink, @intCast(dist_sym));
+                    if (dist_bits > 0) {
+                        try self.bit_writer.writeBits(sink, dist_extra, dist_bits);
+                    }
+                    
+                    cursor += match.len;
+                    continue;
+                }
             }
-            try self.lit_tree.writeSymbol(&self.bit_writer, self.sink, self.data[cursor]);
+
+            try self.lit_tree.writeSymbol(&self.bit_writer, sink, data[cursor]);
             cursor += 1;
         }
         // end of block
-        try self.lit_tree.writeSymbol(&self.bit_writer, self.sink, 256);
+        try self.lit_tree.writeSymbol(&self.bit_writer, sink, 256);
     }
 
-    fn compressWholeData(self: *Self) !void {
+    pub fn compress(self: *Self, sink: *std.io.Writer, data: []const u8) !void {
         var i: usize = 0;
-        while (i < self.data.len) {
+        while (i < data.len) {
             const beg = i;
             i += FLATE_MAX_BLOCK_LEN;
-            const is_final = i >= self.data.len;
-            try self.compressBlock(beg, @min(i, self.data.len), is_final);
+            const is_final = i >= data.len;
+            const ctx: BlockContext = .{
+                .data = data,
+                .bl_start = @intCast(beg),
+                .bl_end = @intCast(@min(i, data.len)),
+            };
+            try self.compressBlock(sink, ctx, is_final);
         }
-        try self.bit_writer.flushByteAligned(self.sink);
+        try self.bit_writer.flushByteAligned(sink);
     }
 };
 
@@ -668,7 +772,7 @@ pub fn compress(data: []const u8, sink: *std.io.Writer, alloc: Alloc) !void {
     // }
     // return 0;
     //
-    var comp: Compressor = .init(alloc, sink, data);
-    try comp.compressWholeData();
-    
+    var comp: Compressor = try .init(alloc);
+    defer comp.deinit(alloc);
+    try comp.compress(sink, data);
 }
