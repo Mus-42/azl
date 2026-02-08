@@ -1,6 +1,10 @@
 # Almost a zip library
 
-AZL implements small but usable subset of `.zip` spec.
+Custom, relatively small library for in-memory operations on `.zip` archives (and as deflate compressor/decompressor).
+
+The library was created mostly for educational purposes and personal use.
+
+Code is mostly untested.
 
 ## Usage
 
@@ -22,7 +26,7 @@ and add to your build.zig this lines:
 
 ## Examples
 
-Examples can be found in examples folder.
+Code examples can be found in examples folder.
 
 To run use:
 
@@ -36,7 +40,9 @@ zig build compress -- path/to/your/folder compressed_folder.zip
 
 ## Limitations
 
-In particular: no Zip64, no encryption, only deflate / store compression methods, no non-seekable streams support.
+In particular: no Zip64, no encryption, only deflate / store compression methods.
 
-Aslo following assumption been made: ``End of central directory`` is located right at the end of the file. 
-(true for most wild files but not required by the spec)
+Slow. At least ~2X slower than ZLIB for decompression and even more for compression while providing a bit worse compression quality.
+
+Also following assumption been made: ``End of central directory`` is located right at the end of the file. 
+(holds true for the most of wild files but not acutally required by the spec)
