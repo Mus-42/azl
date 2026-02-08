@@ -1,12 +1,19 @@
 const std = @import("std");
 const Alloc = std.mem.Allocator;
 
-pub const sa = @import("suffix_array.zig");
 pub const bit_io = @import("bit_io.zig");
 pub const huffman = @import("huffman.zig");
+pub const sm = @import("string_matcher.zig");
+
+test {
+    _ = bit_io;
+    _ = huffman;
+    _ = sm;
+}
 
 pub const FLATE_MAX_LOOKBACK_DIST = 32 * 1024;
 pub const FLATE_MAX_LOOKBACK_LEN = 258;
+pub const FLATE_MIN_LOOKBACK_LEN = 3;
 pub const FLATE_BUF_LEN = FLATE_MAX_LOOKBACK_DIST;
 pub const FLATE_MAX_BLOCK_LEN = 1<<16;
 
@@ -140,28 +147,6 @@ const Decompressor = struct {
         }
     }
 
-    // fn streamImpl(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-    //     std.debug.assert(limit == .unlimited);
-    //     const self: *Self = @fieldParentPtr("interface", r);
-    //     if (self.state == .ended) {
-    //         return error.EndOfStream;
-    //     }
-    //     if (self.state == .invalid) {
-    //         return error.ReadFailed;
-    //     }
-    //     return self.processSingleBlock(w) catch |err| switch (err) {
-    //         // TODO handle errors in a smart way???
-    //         error.EndOfStream => {
-    //             self.state = .invalid;
-    //             return error.ReadFailed;
-    //         },
-    //         else => {
-    //             self.state = .invalid;
-    //             return error.ReadFailed;
-    //         }
-    //     };
-    // }
-
     fn processWholeStream(self: *Self, w: *std.io.Writer) !usize {
         var total_size: usize = 0;
         while (self.state == .reading) {
@@ -239,102 +224,40 @@ const Decompressor = struct {
 };
 
 /// decompresses flate stream until stream reaches final block or error is returned
-pub fn decompress(source: *std.io.Reader, sink: *std.io.Writer, buf: *[FLATE_BUF_LEN]u8) !usize {
-    var dec: Decompressor = .init(source, buf);
+pub fn decompress(source: *std.io.Reader, sink: *std.io.Writer) !usize {
+    const bufs = struct  {
+        threadlocal var buf: [FLATE_BUF_LEN]u8 = undefined;
+    };
+    var dec: Decompressor = .init(source, &bufs.buf);
     return try dec.processWholeStream(sink);
 }
 
 const Compressor = struct {
-    sa_builder: sa.SuffixArrayBuilder,
+    data: []const u8,
+    matcher: *sm.StringMatcher,
     sink: *std.io.Writer = undefined,
     bit_writer: bit_io.BitWriter = .{},
     lit_tree: lit_huffman.Encoder = undefined,
     dist_tree: dist_huffman.Encoder = undefined,
 
     pub const BlockContext = struct {
-        data: []const u8,
-        bl_start: u32,
-        bl_end: u32,
-        sa: []const u32 = undefined,
-        lcp: []const u32 = undefined,
-        rev_sa: []const u32 = undefined,
-        lookup_start: u32 = undefined,
     };
 
     const Self = @This();
 
-    fn init(alloc: Alloc) !Self {
-        var sa_builder: sa.SuffixArrayBuilder = try .init(alloc);
-        errdefer sa_builder.deinit(alloc);
+    fn init(alloc: Alloc, data: []const u8, matcher: *sm.StringMatcher) !Self {
+        _ = alloc;
+        matcher.* = .{ .data = data, .match_limits = .fromPreset(.fast) };
 
         return .{ 
-            .sa_builder = sa_builder,
+            .data = data,
+            .matcher = matcher,
         };
     }
 
     fn deinit(self: *Self, alloc: Alloc) void {
-        self.sa_builder.deinit(alloc);
-    }
-
-    const Match = struct {
-        len: u16,
-        dist: u16,
-    };
-
-    fn tryFindMatch(self: *Self, ctx: BlockContext, position: u32) ?Match {
         _ = self;
-
-        const pos = position - ctx.lookup_start;
-        const sa_index = ctx.rev_sa[pos];
-
-        const MIN_MATCH_LEN = 3;
-
-        var best_match_pos: u32 = 0;
-        var best_match_len: u32 = 0;
-
-        const max_match_len: u32 = @intCast(@min(ctx.bl_end - position, FLATE_MAX_LOOKBACK_LEN));
-
-        var i = sa_index;
-        var i_match_len: u32 = max_match_len;
-        while (i > 0) {
-            i -= 1;
-            i_match_len = @min(ctx.lcp[i], i_match_len);
-            if (i_match_len < best_match_len or i_match_len < MIN_MATCH_LEN) break;
-            if (ctx.sa[i] < pos) {
-                if (best_match_len == i_match_len) {
-                    best_match_pos = @max(best_match_pos, ctx.sa[i]);
-                } else {
-                    best_match_pos = ctx.sa[i];
-                }
-                best_match_len = i_match_len;
-            }
-        }
-        i = sa_index;
-        i_match_len = max_match_len;
-        while (i < ctx.lcp.len) {
-            i_match_len = @min(ctx.lcp[i], i_match_len);
-            i += 1;
-            if (i_match_len < best_match_len or i_match_len < MIN_MATCH_LEN) break;
-            if (ctx.sa[i] < pos) {
-                if (best_match_len == i_match_len) {
-                    best_match_pos = @max(best_match_pos, ctx.sa[i]);
-                } else {
-                    best_match_pos = ctx.sa[i];
-                }
-                best_match_len = i_match_len;
-            }
-        }
-
-        if (best_match_len < MIN_MATCH_LEN or best_match_pos + FLATE_MAX_BLOCK_LEN <= pos) {
-            return null;
-        }
-
-        // std.debug.assert(std.mem.eql(u8, ctx.data[ctx.lookup_start+best_match_pos..][0..best_match_len], ctx.data[position..][0..best_match_len]));
-
-        return .{
-            .len = @intCast(best_match_len),
-            .dist = @intCast(pos - best_match_pos),
-        };
+        _ = alloc;
     }
 
     fn lenToSym(len: u16) u16 {
@@ -370,7 +293,7 @@ const Compressor = struct {
             n_dist -= 1;
         }
 
-
+        // TODO clean it up. looks horrible.
         var cur_code: usize = 0;
         for (&[2][]const u4{self.lit_tree.lengths[0..n_lit], self.dist_tree.lengths[0..n_dist]}) |code_len| {
             var i: usize = 0;
@@ -449,25 +372,24 @@ const Compressor = struct {
     fn compressBlock(
         self: *Self,
         sink: *std.Io.Writer,
-        block_context: BlockContext,
+        bl_start: u32,
+        bl_end: u32,
         is_final: bool
     ) !void {
-        const data = block_context.data;
-        var ctx = block_context;
-        const lookup_start = block_context.bl_start -| FLATE_MAX_LOOKBACK_DIST;
-        ctx.lookup_start = lookup_start;
-        ctx.sa = self.sa_builder.constructSuffixArray(data[lookup_start..ctx.bl_end]);
-        ctx.lcp = self.sa_builder.constructLcp(data[lookup_start..ctx.bl_end], ctx.sa);
-        ctx.rev_sa = self.sa_builder.constructRevSa(ctx.sa);
+        const data = self.data;
         
-        var cursor = ctx.bl_start;
-
         var lit_freq: [286]u16 = @splat(0);
         var dist_freq: [30]u16 = @splat(0);
 
         lit_freq[256] = 1;
-        while (cursor < ctx.bl_end) {
-            if (self.tryFindMatch(ctx, cursor)) |match| {
+
+        // TODO reunning this 2 times in unreliable.
+        // TODO run once and store results
+        var cursor = bl_start;
+        while (cursor < bl_end) {
+            self.matcher.seekTo(cursor);
+            const max_len = bl_end - cursor;
+            if (self.matcher.findLongestMatch(max_len)) |match| {
                 const lit_sym = lenToSym(match.len);
                 const dist_sym = distToSym(match.dist);
 
@@ -505,14 +427,19 @@ const Compressor = struct {
             },
         }
 
-        cursor = ctx.bl_start;
-        while (cursor < ctx.bl_end) {
-            if (self.tryFindMatch(ctx, cursor)) |match| {
+        cursor = bl_start;
+        while (cursor < bl_end) {
+            self.matcher.seekTo(cursor);
+            const max_len = bl_end - cursor;
+            if (self.matcher.findLongestMatch(max_len)) |match| {
                 const lit_sym = lenToSym(match.len);
                 const dist_sym = distToSym(match.dist);
                 
                 const approx_len = @as(u32, 24) + LIT_SYM_EXTRA_BITS[lit_sym - 257] + DIST_SYM_EXTRA_BITS[dist_sym];
                 if (approx_len < match.len * 8) {
+                    std.debug.assert(lit_freq[lit_sym] > 0);
+                    std.debug.assert(dist_freq[dist_sym] > 0);
+
                     const len_extra = match.len - LIT_SYM_OFFSETS[lit_sym - 257];
                     const dist_extra = match.dist - DIST_SYM_OFFSETS[dist_sym];
 
@@ -547,12 +474,9 @@ const Compressor = struct {
             const beg = i;
             i += FLATE_MAX_BLOCK_LEN;
             const is_final = i >= data.len;
-            const ctx: BlockContext = .{
-                .data = data,
-                .bl_start = @intCast(beg),
-                .bl_end = @intCast(@min(i, data.len)),
-            };
-            try self.compressBlock(sink, ctx, is_final);
+            const bl_start: u32 = @intCast(beg);
+            const bl_end: u32 = @intCast(@min(i, data.len));
+            try self.compressBlock(sink, bl_start, bl_end, is_final);
             // std.debug.print("block: {}/{}\n", .{i/FLATE_MAX_BLOCK_LEN, data.len/FLATE_MAX_BLOCK_LEN+1});
         }
         try self.bit_writer.flushByteAligned(sink);
@@ -563,7 +487,43 @@ const Compressor = struct {
 /// compresses data into flate stream
 /// limitations: data should be fully read into memory
 pub fn compress(data: []const u8, sink: *std.io.Writer, alloc: Alloc) !void {
-    var comp: Compressor = try .init(alloc);
+    const bufs = struct {
+        threadlocal var matcher: sm.StringMatcher = undefined;
+    };
+
+    var comp: Compressor = try .init(alloc, data, &bufs.matcher);
     defer comp.deinit(alloc);
     try comp.compress(sink, data);
+}
+
+
+fn testFlateOn(data: []const u8) !void {
+    if (data.len == 0) return; // TODO
+    const alloc = std.testing.allocator;
+    var compression_buf: std.Io.Writer.Allocating = .init(alloc);
+    defer compression_buf.deinit(); 
+    try compress(data, &compression_buf.writer, alloc);
+    var decompression_buf: std.Io.Writer.Allocating = .init(alloc);
+    defer decompression_buf.deinit(); 
+    var source: std.Io.Reader = .fixed(compression_buf.written());
+    _ = try decompress(&source, &decompression_buf.writer);
+
+    try std.testing.expectEqual(0, source.bufferedLen());
+    try std.testing.expectEqualSlices(u8, data, decompression_buf.written());
+}
+
+// TODO when zig's builtin fuzzer would be good enough relace that with fuzzer/add fuzzer?
+test "flate compress-decompress" {
+    const INPUTS: []const []const u8 = &.{
+        "a",
+        "aaaaaaaa",
+        "abababab",
+        "abcdefgh",
+        "abcdabcd",
+        // TODO
+    };
+
+    for (INPUTS) |data| {
+        try testFlateOn(data);
+    }
 }

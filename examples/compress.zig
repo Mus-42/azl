@@ -42,7 +42,6 @@ pub fn main() !void {
             // TODO write directories?
             continue;
         }
-
         std.debug.print("compressing {s}\n", .{entry.path});
 
         const file_data = try entry.dir.readFileAlloc(alloc, entry.basename, 1<<28);

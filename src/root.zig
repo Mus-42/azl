@@ -2,6 +2,10 @@ const std = @import("std");
 pub const flate = @import("flate.zig");
 const Alloc = std.mem.Allocator;
 
+test {
+    _ = flate;
+}
+
 pub const CompressionMethod = enum(u16) {
     none    = 0,
     deflate = 8,
@@ -211,18 +215,13 @@ pub fn ZipReader(comptime SeekableStream: type) type {
             var limited = reader.limited(@enumFromInt(entry.compressed_size), &buf);
             var sink = output_stream.hashed(std.hash.crc.Crc32.init(), &buf2);
 
-            const big_buf = struct {
-                threadlocal var decompress_buf: [flate.FLATE_BUF_LEN]u8 = undefined;
-            };
 
             switch (entry.compression_method) {
                 .none => {
                     uncompressed_size = @intCast(try limited.interface.streamRemaining(&sink.writer));
                 },
                 .deflate => {
-                    uncompressed_size = @intCast(try flate.decompress(&limited.interface, &sink.writer, &big_buf.decompress_buf));
-                    // var decompress: flate.Decompressor = .init(&limited.interface, &big_buf.decompress_buf);
-                    // uncompressed_size = @intCast(try decompress.interface.streamRemaining(&sink.writer));
+                    uncompressed_size = @intCast(try flate.decompress(&limited.interface, &sink.writer));
                 },
                 _ => unreachable,
             }
