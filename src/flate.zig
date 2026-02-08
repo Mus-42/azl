@@ -355,6 +355,96 @@ const Compressor = struct {
         return 29;
     }
 
+    fn writeDynamicBlockHuffmanTree(self: *Self, sink: *std.Io.Writer) !void {
+        const MAX_LEN = 286 + 30;
+        var code_len_encoded: [MAX_LEN]u8 = undefined;
+        var code_len_extra: [MAX_LEN]u8 = undefined;
+
+        var n_lit = self.lit_tree.lengths.len;
+        while (n_lit > 257 and self.lit_tree.lengths[n_lit-1] == 0) {
+            n_lit -= 1;
+        }
+
+        var n_dist = self.dist_tree.lengths.len;
+        while (n_dist > 257 and self.dist_tree.lengths[n_dist-1] == 0) {
+            n_dist -= 1;
+        }
+
+
+        var cur_code: usize = 0;
+        for (&[2][]const u4{self.lit_tree.lengths[0..n_lit], self.dist_tree.lengths[0..n_dist]}) |code_len| {
+            var i: usize = 0;
+            while (i < code_len.len) {
+                // try to encode multiple zeros
+                var j = i;
+                while (j < code_len.len and code_len[j] == 0) {
+                    j += 1;
+                }
+                if (j-i >= 3) {
+                    if (j-i >= 11) {
+                        const dist = @min(j-i, 11 + std.math.maxInt(u7));
+                        code_len_encoded[cur_code] = 18;
+                        code_len_extra[cur_code] = @intCast(dist - 11);
+                        cur_code += 1;
+                        i += dist;
+                        continue;
+                    }
+                    code_len_encoded[cur_code] = 17;
+                    code_len_extra[cur_code] = @intCast(j - i - 3);
+                    cur_code += 1;
+                    i = j;
+                    continue;
+                }
+                j = i+1;
+                while (j < code_len.len and code_len[i] == code_len[j]) {
+                    j += 1;
+                }
+
+                code_len_encoded[cur_code] = code_len[i];
+                cur_code += 1;
+                i += 1;
+
+                if (j-i >= 3) {
+                    const dist = @min(j-i, 3 + std.math.maxInt(u2));
+                    code_len_encoded[cur_code] = 16;
+                    code_len_extra[cur_code] = @intCast(dist - 3);
+                    cur_code += 1;
+                    i += dist;
+                }
+            }
+        }
+
+        var code_len_freq: [19]u16 = @splat(0);
+        for (code_len_encoded[0..cur_code]) |code| {
+            code_len_freq[code] += 1;
+        }
+        const code_len_tree: code_len_huffman.Encoder = .initFreq(&code_len_freq);
+
+        var n_code_len: usize = DYNAMIC_HC_LEN_CODES_LEN_ORDER.len;
+        while (n_code_len > 4 and code_len_tree.lengths[DYNAMIC_HC_LEN_CODES_LEN_ORDER[n_code_len-1]] == 0) {
+            n_code_len -= 1;
+        }
+
+        try self.bit_writer.writeBits(sink, @as(u5, @intCast(n_lit - 257)), 5);
+        try self.bit_writer.writeBits(sink, @as(u5, @intCast(n_dist - 1)), 5);
+        try self.bit_writer.writeBits(sink, @as(u4, @intCast(n_code_len - 4)), 4);
+
+        for (DYNAMIC_HC_LEN_CODES_LEN_ORDER[0..n_code_len]) |i| {
+            try self.bit_writer.writeUint(sink, u3, @intCast(code_len_tree.lengths[i]));
+        }
+
+        for (code_len_encoded[0..cur_code], code_len_extra[0..cur_code]) |code, extra| {
+            try code_len_tree.writeSymbol(&self.bit_writer, sink, @intCast(code));
+            if (code == 16) {
+                try self.bit_writer.writeUint(sink, u2, @intCast(extra));
+            } else if (code == 17) {
+                try self.bit_writer.writeUint(sink, u3, @intCast(extra));
+            } else if (code == 18) {
+                try self.bit_writer.writeUint(sink, u7, @intCast(extra));
+            }
+        }
+    }
+
     // compress [start, end) chunk of data
     fn compressBlock(
         self: *Self,
@@ -380,17 +470,21 @@ const Compressor = struct {
             if (self.tryFindMatch(ctx, cursor)) |match| {
                 const lit_sym = lenToSym(match.len);
                 const dist_sym = distToSym(match.dist);
-                lit_freq[lit_sym] += 1;
-                dist_freq[dist_sym] += 1;
-                cursor += match.len;
-            } else {
-                lit_freq[data[cursor]] += 1;
-                cursor += 1;
-            }
+
+                const approx_len = @as(u32, 24) + LIT_SYM_EXTRA_BITS[lit_sym - 257] + DIST_SYM_EXTRA_BITS[dist_sym];
+                if (approx_len < match.len * 8) {
+                    lit_freq[lit_sym] += 1;
+                    dist_freq[dist_sym] += 1;
+                    cursor += match.len;
+                    continue;
+                }
+            } 
+            lit_freq[data[cursor]] += 1;
+            cursor += 1;
         }
 
         // TODO decide between stored/static/dynamic
-        var block_type: BlockType = .static;
+        var block_type: BlockType = .dynamic;
         _ = &block_type;
 
         try self.bit_writer.writeUint(sink, u1, @intFromBool(is_final));
@@ -398,15 +492,16 @@ const Compressor = struct {
 
         switch (block_type) {
             .stored => {
-                self.lit_tree = .initFreq(&lit_freq);
-                self.dist_tree = .initFreq(&dist_freq);
+                @panic("TODO");
             },
             .static => {
                 self.lit_tree = .initStatic();
                 self.dist_tree = .initStatic();
             },
             .dynamic => {
-                @panic("TODO");
+                self.lit_tree = .initFreq(&lit_freq);
+                self.dist_tree = .initFreq(&dist_freq);
+                try self.writeDynamicBlockHuffmanTree(sink);
             },
         }
 
@@ -458,6 +553,7 @@ const Compressor = struct {
                 .bl_end = @intCast(@min(i, data.len)),
             };
             try self.compressBlock(sink, ctx, is_final);
+            // std.debug.print("block: {}/{}\n", .{i/FLATE_MAX_BLOCK_LEN, data.len/FLATE_MAX_BLOCK_LEN+1});
         }
         try self.bit_writer.flushByteAligned(sink);
     }
@@ -467,27 +563,6 @@ const Compressor = struct {
 /// compresses data into flate stream
 /// limitations: data should be fully read into memory
 pub fn compress(data: []const u8, sink: *std.io.Writer, alloc: Alloc) !void {
-    // const MIN_K = 3;
-    // var i: usize = 0;
-    // while (i < data.len) {
-    //     var last_i: ?usize = null;
-    //     var k: usize = MIN_K;
-    //     const max_k = data.len-i;
-    //     while (k <= max_k) : (k += 1) {
-    //         const last_index = std.mem.lastIndexOf(u8, data[0..i+k-1], data[i..i+k]);
-    //         if (last_index == null) break;
-    //         last_i = last_index;
-    //     }
-    //     if (last_i != null) {
-    //         try sink.print("[{}..][0..{}]\n", .{last_i.?, k});
-    //         i += k;
-    //     } else {
-    //         try sink.print("'{}'\n", .{data[i]});
-    //         i += 1;
-    //     }
-    // }
-    // return 0;
-    //
     var comp: Compressor = try .init(alloc);
     defer comp.deinit(alloc);
     try comp.compress(sink, data);

@@ -117,7 +117,7 @@ pub fn Huffman(comptime max_symbols: usize, comptime max_code_bits: u4, comptime
 
                     // "merge" previous package and input (into sorted seq) then combine into new package
                     for (0..2*new_packages_count) |i| {
-                        if (input_i < n and input[input_i].freq <= packages_prev[pkg_i]) {
+                        if (input_i < n and (pkg_i == packages_count or input[input_i].freq <= packages_prev[pkg_i])) {
                             packages_curr[i/2] += input[input_i].freq;
                             input_i += 1;
                         } else {
@@ -364,9 +364,10 @@ pub fn Huffman(comptime max_symbols: usize, comptime max_code_bits: u4, comptime
                 }
             }
 
-            pub fn writeSymbol(self: *Self, bit_writer: *bit_io.BitWriter, sink: *std.Io.Writer, symbol: Symbol) !void {
+            pub fn writeSymbol(self: *const Self, bit_writer: *bit_io.BitWriter, sink: *std.Io.Writer, symbol: Symbol) !void {
                 if (symbol >= max_symbols or self.lengths[symbol] == 0) {
                     @branchHint(.cold);
+                    std.debug.print("sym={}\n", .{symbol});
                     return error.InvalidHuffmanTreeSymbol;
                 }
                 try bit_writer.writeBits(sink, self.rcode[symbol], self.lengths[symbol]);
