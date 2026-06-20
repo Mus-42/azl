@@ -115,7 +115,7 @@ const Decompressor = struct {
     }
 
 
-    fn writeByte(self: *Self, w: *std.io.Writer, byte: u8) !void {
+    fn writeByte(self: *Self, w: *std.Io.Writer, byte: u8) !void {
         try w.writeByte(byte);
         // TODO on error set state to "broken"
         self.buf[self.buf_end] = byte;
@@ -147,7 +147,7 @@ const Decompressor = struct {
         }
     }
 
-    fn processWholeStream(self: *Self, w: *std.io.Writer) !usize {
+    fn processWholeStream(self: *Self, w: *std.Io.Writer) !usize {
         var total_size: usize = 0;
         while (self.state == .reading) {
             total_size += try self.processSingleBlock(w);
@@ -155,7 +155,7 @@ const Decompressor = struct {
         return total_size;
     }
 
-    fn processSingleBlock(self: *Self, w: *std.io.Writer) !usize {
+    fn processSingleBlock(self: *Self, w: *std.Io.Writer) !usize {
         const is_final = try self.bit_reader.takeUint(self.input, u1) != 0;
         if (is_final) {
             // we trust this flag and didn't verify if that's the case
@@ -189,7 +189,7 @@ const Decompressor = struct {
         return self.decodeBlockCode(w);
     }
     
-    fn decodeBlockCode(self: *Self, w: *std.io.Writer) !usize {
+    fn decodeBlockCode(self: *Self, w: *std.Io.Writer) !usize {
         var written: usize = 0;
         while (true) {
             const sym = try self.lit_tree.readSymbol(&self.bit_reader, self.input);
@@ -224,7 +224,7 @@ const Decompressor = struct {
 };
 
 /// decompresses flate stream until stream reaches final block or error is returned
-pub fn decompress(source: *std.io.Reader, sink: *std.io.Writer) !usize {
+pub fn decompress(source: *std.Io.Reader, sink: *std.Io.Writer) !usize {
     const bufs = struct  {
         threadlocal var buf: [FLATE_BUF_LEN]u8 = undefined;
     };
@@ -235,7 +235,7 @@ pub fn decompress(source: *std.io.Reader, sink: *std.io.Writer) !usize {
 const Compressor = struct {
     data: []const u8,
     matcher: *sm.StringMatcher,
-    sink: *std.io.Writer = undefined,
+    sink: *std.Io.Writer = undefined,
     bit_writer: bit_io.BitWriter = .{},
     lit_tree: lit_huffman.Encoder = undefined,
     dist_tree: dist_huffman.Encoder = undefined,
@@ -468,7 +468,7 @@ const Compressor = struct {
         try self.lit_tree.writeSymbol(&self.bit_writer, sink, 256);
     }
 
-    pub fn compress(self: *Self, sink: *std.io.Writer, data: []const u8) !void {
+    pub fn compress(self: *Self, sink: *std.Io.Writer, data: []const u8) !void {
         var i: usize = 0;
         while (i < data.len) {
             const beg = i;
@@ -486,7 +486,7 @@ const Compressor = struct {
 
 /// compresses data into flate stream
 /// limitations: data should be fully read into memory
-pub fn compress(data: []const u8, sink: *std.io.Writer, alloc: Alloc) !void {
+pub fn compress(data: []const u8, sink: *std.Io.Writer, alloc: Alloc) !void {
     const bufs = struct {
         threadlocal var matcher: sm.StringMatcher = undefined;
     };

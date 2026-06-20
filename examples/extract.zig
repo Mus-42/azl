@@ -7,49 +7,51 @@ fn print_usage() void {
 
 var buf2: [32768 * 4]u8 = undefined;
 
-pub fn main() !void {
-    var args = std.process.args();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    const io = init.io;
+
+    var args = try init.minimal.args.iterateAllocator(alloc);
     _ = args.next().?;
     const extract_dir = args.next() orelse {
         print_usage();
         return error.InvalidArguments;
     };
+
     const archive_filename = args.next() orelse {
         print_usage();
         return error.InvalidArguments;
     };
 
-    std.fs.cwd().makeDir(extract_dir) catch |err| {
+    std.Io.Dir.cwd().createDir(io, extract_dir, .default_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 
-    var out_dir = try std.fs.cwd().openDir(extract_dir, .{});
-    defer out_dir.close();
+    var out_dir = try std.Io.Dir.cwd().openDir(io, extract_dir, .{});
+    defer out_dir.close(io);
 
-    const file = try std.fs.cwd().openFile(archive_filename, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(io, archive_filename, .{});
+    defer file.close(io);
     
     // TODO
     var buf: [8192]u8 = undefined;
-    var reader = file.reader(&buf);
+    var reader = file.reader(io, &buf);
     var iter = try azl.zipReader(&reader);
 
     while (try iter.next()) |entry| {
         std.debug.print("extracting {s}\n", .{entry.name});
         if (entry.isDirectory()) {
-            try out_dir.makePath(entry.name[0 .. entry.name.len - 1]);
+            try out_dir.createDirPath(io, entry.name[0 .. entry.name.len - 1]);
             continue;
         }
 
         if (std.fs.path.dirname(entry.name)) |dirname| {
-            try out_dir.makePath(dirname);
+            try out_dir.createDirPath(io, dirname);
         }
 
-        
-
-        const entry_out = try out_dir.createFile(entry.name, .{});
-        defer entry_out.close();
-        var writer = entry_out.writer(&buf2);
+        const entry_out = try out_dir.createFile(io, entry.name, .{});
+        defer entry_out.close(io);
+        var writer = entry_out.writer(io, &buf2);
         try iter.extractFile(entry, &writer.interface);
         try writer.end();
     }

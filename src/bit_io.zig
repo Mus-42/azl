@@ -11,17 +11,17 @@ pub const BitReader = struct {
         self.buffered = 0;
     }
 
-    pub fn takeBits(self: *Self, input: *std.io.Reader, count: u4) !u16 {
+    pub fn takeBits(self: *Self, input: *std.Io.Reader, count: u4) !u16 {
         const bits = try self.peekBits(input, count);
         self.tossBits(input, count);
         return bits;
     }
 
-    pub fn takeUint(self: *Self, input: *std.io.Reader, comptime U: type) !U {
+    pub fn takeUint(self: *Self, input: *std.Io.Reader, comptime U: type) !U {
         return @intCast(try self.takeBits(input, @intCast(@bitSizeOf(U))));
     }
 
-    pub fn peekBits(self: *Self, input: *std.io.Reader, count: u4) !u16 {
+    pub fn peekBits(self: *Self, input: *std.Io.Reader, count: u4) !u16 {
         if (count == 0) return 0;
         while (count > self.buffered_count) {
             const buf = self.buffered_count;
@@ -44,7 +44,7 @@ pub const BitReader = struct {
         return @intCast(ret);
     }
 
-    pub fn tossBits(self: *Self, input: *std.io.Reader, count: u4) void {
+    pub fn tossBits(self: *Self, input: *std.Io.Reader, count: u4) void {
         std.debug.assert(self.buffered_count >= count);
         if (count == 0) return;
         const to_toss = (@as(u5, count) -| (self.buffered_count&7) + 7) >> 3;
@@ -62,7 +62,7 @@ pub const BitWriter = struct {
     const Self = @This();
     
     /// flush all remaining bits and align to byte boundry
-    pub fn flushByteAligned(self: *Self, sink: *std.io.Writer) !void {
+    pub fn flushByteAligned(self: *Self, sink: *std.Io.Writer) !void {
         // round to next multiple of 8
         self.buffered_count = (self.buffered_count + 7) & ~@as(u5, 0b11);
         try self.partialFlushBuffered(sink);
@@ -70,17 +70,17 @@ pub const BitWriter = struct {
         self.buffered = 0;
     }
 
-    pub fn writeBits(self: *Self, sink: *std.io.Writer, bits: u16, count: u4) !void {
+    pub fn writeBits(self: *Self, sink: *std.Io.Writer, bits: u16, count: u4) !void {
         self.buffered |= @as(u32, bits) << self.buffered_count;
         self.buffered_count += count;
         try self.partialFlushBuffered(sink);
     }
 
-    pub fn writeUint(self: *Self, sink: *std.io.Writer, comptime U: type, bits: U) !void {
+    pub fn writeUint(self: *Self, sink: *std.Io.Writer, comptime U: type, bits: U) !void {
         return try self.writeBits(sink, bits, @intCast(@bitSizeOf(U)));
     }
 
-    pub fn partialFlushBuffered(self: *Self, sink: *std.io.Writer) !void {
+    pub fn partialFlushBuffered(self: *Self, sink: *std.Io.Writer) !void {
         while (self.buffered_count >= 8) {
             try sink.writeByte(@intCast(self.buffered & 0xFF));
             self.buffered_count -= 8;
